@@ -105,7 +105,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $exefsDir "main")) -or -not (Test-Pa
     if (Test-Path -LiteralPath $extractTmp) { Remove-Item -Recurse -Force $extractTmp }
     $env:PYTHONPATH = (Join-Path $source "tools")
     try {
-        & $pyExe -m nup extract $Nup --out $extractTmp
+        & $pyExe -m nup.cli extract $Nup --out $extractTmp
         if ($LASTEXITCODE -ne 0) { Say "nup extract failed"; exit 1 }
     } finally {
         Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
