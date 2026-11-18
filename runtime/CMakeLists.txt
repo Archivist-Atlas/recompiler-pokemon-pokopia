@@ -87,6 +87,10 @@ else()
 endif()
 if(NXRT_WINDOWS)
     list(FILTER NXRT_SOURCES EXCLUDE REGEX "/src/os/os_posix.*\\.cpp$")   # the shim itself: POSIX targets only
+    if(MINGW)
+        # MinGW/Clang64 uses os_posix_a2b.cpp (astcenc + bc7enc) instead of MSVC/ISPC astc2bc7.lib.
+        list(APPEND NXRT_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/os/os_posix_a2b.cpp")
+    endif()
     # Apple-only and Linux-only platform services: Windows plays through XAudio2 and lists devices through WASAPI (below).
     list(FILTER NXRT_SOURCES EXCLUDE REGEX "/src/services/audio_coreaudio\\.cpp$")
     list(FILTER NXRT_SOURCES EXCLUDE REGEX "/src/services/audio_devices_posix\\.cpp$")
@@ -152,6 +156,9 @@ if(NOT NXRT_WINDOWS)
 endif()
 if(NOT NXRT_WINDOWS OR MINGW)
     if(MINGW)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/textures/include/astc2bc7.h")
+            target_include_directories(nxrt PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../tools/textures/include")
+        endif()
         add_library(nxrt_bc7enc STATIC third_party/bc7enc/bc7enc.c)
         target_include_directories(nxrt_bc7enc PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bc7enc")
         set_target_properties(nxrt_bc7enc PROPERTIES C_STANDARD 11)
@@ -196,6 +203,12 @@ if(EXISTS "${NXRT_RECOMP_INCLUDE}")
 endif()
 if(NXRT_WINDOWS)
     target_link_libraries(nxrt PUBLIC psapi)
+    if(MINGW)
+        # MinGW/Clang64 ignores MSVC #pragma comment(lib, ...) directives.
+        target_link_libraries(nxrt PUBLIC
+            avrt bcrypt cfgmgr32 dbghelp dxgi iphlpapi mfplat mfreadwrite mfuuid
+            ole32 shlwapi uuid windowscodecs winhttp winmm ws2_32 xaudio2_8)
+    endif()
 endif()
 add_subdirectory(third_party/pokopia-coop)   # [net] protocol = native: pokopia-native's Link Play (MIT, C11)
 target_link_libraries(nxrt PRIVATE pokopia_coop)

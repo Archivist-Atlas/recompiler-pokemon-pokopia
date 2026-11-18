@@ -347,7 +347,15 @@ bool ext_open(Ext* e, unsigned char* data, size_t size) {
     ComPtr<IStream> st;
     st.Attach(SHCreateMemStream(data, static_cast<UINT>(size)));   // copies the bytes
     if (!st) return false;
+#if defined(__MINGW32__)
+    using CreateBSFn = HRESULT(WINAPI*)(IStream*, IMFByteStream**);
+    HMODULE mfplat = GetModuleHandleW(L"mfplat.dll");
+    if (!mfplat) mfplat = LoadLibraryW(L"mfplat.dll");
+    auto create_bs = mfplat ? reinterpret_cast<CreateBSFn>(GetProcAddress(mfplat, "MFCreateMFByteStreamOnStream")) : nullptr;
+    HRESULT hr = create_bs ? create_bs(st.Get(), &e->bs) : E_NOTIMPL;
+#else
     HRESULT hr = MFCreateMFByteStreamOnStream(st.Get(), &e->bs);
+#endif
     if (FAILED(hr)) { NXLOG_W("movie", "MFCreateMFByteStreamOnStream 0x%08lx", static_cast<unsigned long>(hr)); return false; }
     ComPtr<IMFAttributes> ba;
     if (SUCCEEDED(e->bs.As(&ba))) {

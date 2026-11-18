@@ -259,9 +259,10 @@ struct FpsSettings {
 // ---- quit shortcut ------------------------------------------------------------------------------------------------------------
 // A pad combination and a keyboard key that open the overlay's "Close the game?" prompt (the same prompt as the F1 page's Quit button).
 // Neither reaches the game. The pad buttons are physical ones (before [padmap]), all held on one pad.
+constexpr int32_t kScancodeEscape = 41;                  // SDL_SCANCODE_ESCAPE
 struct QuitSettings {
     uint32_t pad = pad_src_bit(PadSrc::Back) | pad_src_bit(PadSrc::Start);   // [quit] pad: bits of PadSrc, 0 = off (Select + Start)
-    InputId key = {InKind::Key, SDL_SCANCODE_ESCAPE};                                              // [quit] key: Esc opens quit prompt by default
+    InputId key = {InKind::Key, kScancodeEscape};                                              // [quit] key: Esc opens quit prompt by default
 };
 
 // ---- overlay shortcut ---------------------------------------------------------------------------------------------------------

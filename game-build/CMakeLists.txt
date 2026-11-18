@@ -181,8 +181,12 @@ else()
 endif()
 set_source_files_properties(src/pkp_main.cpp PROPERTIES COMPILE_DEFINITIONS "PKP_VERSION=\"${PKP_VERSION}\"")
 if(WIN32)
-    set_source_files_properties(res/pkp.rc PROPERTIES COMPILE_DEFINITIONS "PKP_VER_MAJOR=${PKP_VER_MAJOR};PKP_VER_MINOR=${PKP_VER_MINOR};PKP_VER_PATCH=${PKP_VER_PATCH};PKP_VER_TEXT=\"${PKP_VERSION}\""
-                                OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/pkp.manifest")
+    file(WRITE "${PKP_GEN_INCLUDE}/pkp_ver.h"
+        "#define PKP_VER_MAJOR ${PKP_VER_MAJOR}\n"
+        "#define PKP_VER_MINOR ${PKP_VER_MINOR}\n"
+        "#define PKP_VER_PATCH ${PKP_VER_PATCH}\n"
+        "#define PKP_VER_TEXT \"${PKP_VERSION}\"\n")
+    set_source_files_properties(res/pkp.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/pkp.manifest;${PKP_GEN_INCLUDE}/pkp_ver.h")
 endif()
 target_compile_definitions(pkp PRIVATE PKP_EXEFS_DEFAULT="${PKP_EXEFS_DEFAULT}")
 target_include_directories(pkp PRIVATE "${PKP_GEN_INCLUDE}")
