@@ -1,0 +1,386 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "nxrt/config.h"
+
+#include "nxrt/log.h"
+#include "nxrt/text.h"
+#include "ini_line.h"
+
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace nxrt {
+namespace {
+
+// Lock discipline: g_mu is only held for plain data access. Nothing here calls logf while holding it;
+// config_log_effective copies the snapshot first and logs after the lock is released.
+
+struct Seen {
+    std::string section;   // as first queried
+    std::string key;       // as first queried
+    std::string value;     // effective value, as text
+    std::string source;    // "env", "ini" or "default"
+};
+
+std::mutex g_mu;
+// canonical id ("section" 0x1F "key", lower-case) -> value. config_set values live here too (source "ini").
+std::unordered_map<std::string, std::string> g_ini;
+// every key read so far, keyed by canonical id, ordered for a stable dump.
+std::map<std::string, Seen> g_seen;
+
+std::string S(const char* p) { return p ? std::string(p) : std::string(); }
+
+// Lookup cache (config_cache_env): getenv walks the whole environment under the CRT lock (slow under Wine) and lookup() takes g_mu
+// and builds three strings, on every call; the render thread asks per frame and per draw. Once the host promises the environment no
+// longer changes, each thread keeps the last answer per (section, key) in a small direct-mapped table. The pointers are only the slot
+// index and a fast check: the text is compared too, so a reused buffer cannot alias. Anything that changes the ini
+// (config_load_*, config_clear, config_set) bumps g_gen, which empties every thread's table.
+std::atomic<bool> g_cache_on{false};
+std::atomic<uint64_t> g_gen{1};
+
+using text::is_space;
+using text::lower;
+using text::trim;
+
+std::string canon_id(const std::string& section, const std::string& key) {
+    std::string id = lower(trim(section));
+    id += '\x1f';
+    id += lower(trim(key));
+    return id;
+}
+
+struct Found {
+    bool found;
+    std::string value;
+    const char* source;
+};
+
+struct CacheEnt {
+    const char* sp = nullptr;
+    const char* kp = nullptr;
+    std::string sec, key;
+    uint64_t gen = 0;
+    bool found = false;
+    std::string value;
+    const char* source = "default";
+};
+constexpr size_t kCacheSlots = 256;   // per thread; a thread asks for a few dozen keys at most (a collision only costs a lookup)
+thread_local CacheEnt t_cache[kCacheSlots];
+thread_local Found t_hit;             // the answer handed back by cache_find (valid until the thread's next lookup)
+
+size_t cache_slot(const char* sp, const char* kp) {
+    uint64_t h = reinterpret_cast<uintptr_t>(kp) * 0x9E3779B97F4A7C15ull ^ reinterpret_cast<uintptr_t>(sp) * 0xC2B2AE3D27D4EB4Full;
+    return static_cast<size_t>(h >> 32) % kCacheSlots;
+}
+
+const Found* cache_find(const char* section, const char* key) {
+    if (!g_cache_on.load(std::memory_order_relaxed)) return nullptr;
+    const char* sp = section ? section : "";
+    const char* kp = key ? key : "";
+    const CacheEnt& e = t_cache[cache_slot(sp, kp)];
+    if (e.gen != g_gen.load(std::memory_order_acquire) || e.sp != sp || e.kp != kp || e.sec != sp || e.key != kp) return nullptr;
+    t_hit.found = e.found;
+    t_hit.value = e.value;
+    t_hit.source = e.source;
+    return &t_hit;
+}
+
+// gen = g_gen as read BEFORE the lookup: an ini change during the lookup then leaves the entry already stale.
+void cache_put(const char* section, const char* key, const Found& f, uint64_t gen) {
+    if (!g_cache_on.load(std::memory_order_relaxed)) return;
+    const char* sp = section ? section : "";
+    const char* kp = key ? key : "";
+    CacheEnt& e = t_cache[cache_slot(sp, kp)];
+    e.sp = sp;
+    e.kp = kp;
+    e.sec = sp;
+    e.key = kp;
+    e.found = f.found;
+    e.value = f.value;
+    e.source = f.source;
+    e.gen = gen;
+}
+
+void bump_gen() { g_gen.fetch_add(1, std::memory_order_acq_rel); }
+
+// env > ini > nothing. Does not touch g_seen.
+Found lookup(const std::string& section, const std::string& key) {
+    std::string env = config_env_name(section.c_str(), key.c_str());
+    if (const char* e = std::getenv(env.c_str())) return {true, e, "env"};
+    std::lock_guard<std::mutex> g(g_mu);
+    auto it = g_ini.find(canon_id(section, key));
+    if (it != g_ini.end()) return {true, it->second, "ini"};
+    return {false, std::string(), "default"};
+}
+
+void record(const std::string& section, const std::string& key, const std::string& value, const char* source) {
+    std::lock_guard<std::mutex> g(g_mu);
+    Seen& s = g_seen[canon_id(section, key)];
+    s.section = section;
+    s.key = key;
+    s.value = value;
+    s.source = source;
+}
+
+bool parse_int(const std::string& raw, int64_t& out) {
+    std::string s = trim(raw);
+    size_t i = 0;
+    bool neg = false;
+    if (i < s.size() && s[i] == '-') {
+        neg = true;
+        ++i;
+    }
+    uint64_t base = 10;
+    if (s.size() >= i + 2 && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        base = 16;
+        i += 2;
+    }
+    if (i >= s.size()) return false;
+    uint64_t acc = 0;
+    for (; i < s.size(); ++i) {
+        char c = s[i];
+        uint64_t d;
+        if (c >= '0' && c <= '9')
+            d = static_cast<uint64_t>(c - '0');
+        else if (base == 16 && c >= 'a' && c <= 'f')
+            d = static_cast<uint64_t>(c - 'a' + 10);
+        else if (base == 16 && c >= 'A' && c <= 'F')
+            d = static_cast<uint64_t>(c - 'A' + 10);
+        else
+            return false;
+        if (acc > (UINT64_MAX - d) / base) return false;  // overflow
+        acc = acc * base + d;
+    }
+    const uint64_t limit = neg ? static_cast<uint64_t>(INT64_MAX) + 1 : static_cast<uint64_t>(INT64_MAX);
+    if (acc > limit) return false;
+    out = neg ? static_cast<int64_t>(0 - acc) : static_cast<int64_t>(acc);
+    return true;
+}
+
+bool parse_bool(const std::string& raw, bool& out) {
+    std::string s = lower(trim(raw));
+    if (s == "1" || s == "true" || s == "yes" || s == "on") {
+        out = true;
+        return true;
+    }
+    if (s == "0" || s == "false" || s == "no" || s == "off") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+bool parse_double(const std::string& raw, double& out) {
+    std::string s = trim(raw);
+    if (s.empty()) return false;
+    char* end = nullptr;
+    double v = std::strtod(s.c_str(), &end);
+    if (end != s.c_str() + s.size()) return false;
+    out = v;
+    return true;
+}
+
+// Parses one ini line (ini_line.h) into the current section and stores key/value pairs in `out`.
+void parse_line(const std::string& line, std::string& section, std::unordered_map<std::string, std::string>& out) {
+    ini_line::Line l = ini_line::parse(line);
+    if (l.kind == ini_line::Kind::Section) section = std::move(l.name);
+    else if (l.kind == ini_line::Kind::Key) out[canon_id(section, l.name)] = std::move(l.value);
+}
+
+std::unordered_map<std::string, std::string> parse_ini(const std::string& text) {
+    std::unordered_map<std::string, std::string> out;
+    std::string section;
+    size_t start = 0;
+    while (true) {
+        size_t nl = text.find('\n', start);
+        size_t end = (nl == std::string::npos) ? text.size() : nl;
+        parse_line(text.substr(start, end - start), section, out);
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    return out;
+}
+
+void replace_ini(const std::string& text) {
+    auto parsed = parse_ini(text);  // parse outside the lock
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        g_ini = std::move(parsed);
+    }
+    bump_gen();
+}
+
+std::string fmt_double(double v) {
+    char b[64];
+    std::snprintf(b, sizeof b, "%g", v);
+    return b;
+}
+
+}  // namespace
+
+bool config_load_file(const char* path) {
+    std::FILE* f = path ? std::fopen(path, "rb") : nullptr;
+    if (!f) {
+        config_clear();
+        return false;
+    }
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    replace_ini(text);
+    return true;
+}
+
+void config_clear() {
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        g_ini.clear();
+    }
+    bump_gen();
+}
+
+void config_set(const char* section, const char* key, const char* value) {
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        g_ini[canon_id(S(section), S(key))] = S(value);
+    }
+    bump_gen();
+}
+
+bool config_cache_env(bool on) {
+    // [config] cache = false keeps every lookup uncached (read with the cache off, so the answer is never itself cached).
+    g_cache_on.store(false, std::memory_order_relaxed);
+    bump_gen();
+    if (on && config_get_bool("config", "cache", true)) g_cache_on.store(true, std::memory_order_relaxed);
+    return g_cache_on.load(std::memory_order_relaxed);
+}
+
+std::string config_get_str(const char* section, const char* key, const char* def) {
+    if (const Found* c = cache_find(section, key)) return c->found ? c->value : S(def);
+    std::string sec = S(section), k = S(key);
+    const uint64_t gen = g_gen.load(std::memory_order_acquire);
+    Found f = lookup(sec, k);
+    cache_put(section, key, f, gen);
+    std::string v = f.found ? f.value : S(def);
+    record(sec, k, v, f.source);
+    return v;
+}
+
+int64_t config_get_int(const char* section, const char* key, int64_t def) {
+    if (const Found* c = cache_find(section, key)) {
+        int64_t parsed;
+        return c->found && parse_int(c->value, parsed) ? parsed : def;
+    }
+    std::string sec = S(section), k = S(key);
+    const uint64_t gen = g_gen.load(std::memory_order_acquire);
+    Found f = lookup(sec, k);
+    cache_put(section, key, f, gen);
+    int64_t v = def;
+    if (f.found) {
+        int64_t parsed;
+        if (parse_int(f.value, parsed)) v = parsed;  // invalid text: keep default
+    }
+    record(sec, k, std::to_string(v), f.source);
+    return v;
+}
+
+double config_get_double(const char* section, const char* key, double def) {
+    if (const Found* c = cache_find(section, key)) {
+        double parsed;
+        return c->found && parse_double(c->value, parsed) ? parsed : def;
+    }
+    std::string sec = S(section), k = S(key);
+    const uint64_t gen = g_gen.load(std::memory_order_acquire);
+    Found f = lookup(sec, k);
+    cache_put(section, key, f, gen);
+    double v = def;
+    if (f.found) {
+        double parsed;
+        if (parse_double(f.value, parsed)) v = parsed;
+    }
+    record(sec, k, fmt_double(v), f.source);
+    return v;
+}
+
+bool config_get_bool(const char* section, const char* key, bool def) {
+    if (const Found* c = cache_find(section, key)) {
+        bool parsed;
+        return c->found && parse_bool(c->value, parsed) ? parsed : def;
+    }
+    std::string sec = S(section), k = S(key);
+    const uint64_t gen = g_gen.load(std::memory_order_acquire);
+    Found f = lookup(sec, k);
+    cache_put(section, key, f, gen);
+    bool v = def;
+    if (f.found) {
+        bool parsed;
+        if (parse_bool(f.value, parsed)) v = parsed;
+    }
+    record(sec, k, v ? "true" : "false", f.source);
+    return v;
+}
+
+bool config_has(const char* section, const char* key) {
+    if (const Found* c = cache_find(section, key)) return c->found;
+    std::string sec = S(section), k = S(key);
+    const uint64_t gen = g_gen.load(std::memory_order_acquire);
+    Found f = lookup(sec, k);
+    cache_put(section, key, f, gen);
+    record(sec, k, f.found ? f.value : std::string(), f.source);
+    return f.found;
+}
+
+const char* config_source(const char* section, const char* key) {
+    if (const Found* c = cache_find(section, key)) return c->source;
+    std::string sec = S(section), k = S(key);
+    const uint64_t gen = g_gen.load(std::memory_order_acquire);
+    Found f = lookup(sec, k);
+    cache_put(section, key, f, gen);
+    record(sec, k, f.found ? f.value : std::string(), f.source);
+    return f.source;
+}
+
+void config_log_effective() {
+    std::vector<Seen> snap;
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        snap.reserve(g_seen.size());
+        for (const auto& kv : g_seen) snap.push_back(kv.second);
+    }
+    // logged outside the config lock (logf may call back into config through the [log] keys)
+    for (const Seen& s : snap) {
+        if (s.section.empty())
+            logf(LogLevel::Info, "config", "%s = %s (%s)", s.key.c_str(), s.value.c_str(), s.source.c_str());
+        else
+            logf(LogLevel::Info, "config", "[%s] %s = %s (%s)", s.section.c_str(), s.key.c_str(), s.value.c_str(),
+                 s.source.c_str());
+    }
+}
+
+std::string config_env_name(const char* section, const char* key) {
+    std::string n = "NXRT_";
+    std::string sec = S(section);
+    if (!sec.empty()) {
+        n += sec;
+        n += '_';
+    }
+    n += S(key);
+    for (char& c : n) {
+        if (c >= 'a' && c <= 'z')
+            c = static_cast<char>(c - 'a' + 'A');
+        else if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
+            c = '_';
+    }
+    return n;
+}
+
+}  // namespace nxrt

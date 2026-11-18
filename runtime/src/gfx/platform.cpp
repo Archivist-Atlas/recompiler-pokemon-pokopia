@@ -1,0 +1,761 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// SDL3 platform layer (declarations in include/nxrt/platform.h): window, fullscreen, raw relative mouse, gamepad hot-plug,
+// Vulkan surface, and the translation of SDL events into nxrt::input events (include/nxrt/input.h).
+#include "nxrt/platform.h"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "nxrt/config.h"
+#include "nxrt/host_device.h"
+#include "nxrt/input.h"
+#include "nxrt/log.h"
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <unistd.h>
+#endif
+
+namespace nxrt::platform {
+namespace {
+
+constexpr const char* kTag = "platform";
+constexpr Uint64 kFullscreenWaitMs = 2000;
+
+// All SDL state lives in this file. Everything runs on the thread that created the window.
+bool g_inited = false;
+bool g_quit = false;
+bool g_gamepads = false;
+SDL_Window* g_window = nullptr;
+
+struct OpenPad {
+    SDL_JoystickID id;
+    SDL_Gamepad* pad;
+};
+std::vector<OpenPad> g_pads;
+Uint64 g_last_pad_event_ms = 0;   // when SDL last reported a gamepad added or removed (pad_rescan's quiet check)
+
+input::Event make_event(input::EventType type, uint64_t ts) {
+    input::Event e;
+    e.type = type;
+    e.timestamp_ns = ts;
+    return e;
+}
+
+bool window_flag(SDL_WindowFlags flag) { return g_window != nullptr && (SDL_GetWindowFlags(g_window) & flag) != 0; }
+
+// SDL reports pointer positions in window coordinates; the input queue wants window pixels.
+float pixel_density() {
+    const float d = g_window ? SDL_GetWindowPixelDensity(g_window) : 0.f;
+    return d > 0.f ? d : 1.f;
+}
+
+// Client size in pixels, 0 x 0 while minimised or without a window.
+void current_pixel_size(int* w, int* h) {
+    int pw = 0, ph = 0;
+    if (g_window && !window_flag(SDL_WINDOW_MINIMIZED) && !SDL_GetWindowSizeInPixels(g_window, &pw, &ph)) pw = ph = 0;
+    if (w) *w = pw;
+    if (h) *h = ph;
+}
+
+// Copies a UTF-8 string into a fixed buffer, never splitting a multi-byte character, always NUL terminated.
+void copy_utf8(char* dst, size_t cap, const char* src) {
+    const size_t len = src ? std::strlen(src) : 0;
+    size_t n = len < cap - 1 ? len : cap - 1;
+    if (n < len) {
+        while (n > 0 && (static_cast<unsigned char>(src[n]) & 0xC0) == 0x80) --n;
+    }
+    if (n) std::memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+// The open pad with this id, or nullptr.
+SDL_Gamepad* find_pad(uint32_t id) {
+    for (const OpenPad& p : g_pads) {
+        if (p.id == id) return p.pad;
+    }
+    return nullptr;
+}
+
+// Face positions in GamepadRaw::face_label order: SOUTH, EAST, WEST, NORTH.
+constexpr SDL_GamepadButton kFaceButtons[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST,
+                                               SDL_GAMEPAD_BUTTON_NORTH};
+
+// Maps the label printed on face position p to a GamepadRaw::face_label code (0 A, 1 B, 2 X, 3 Y). Unknown labels keep
+// the position default {0,1,2,3}[p], which equals p.
+uint8_t face_code(SDL_GamepadButtonLabel label, int p) {
+    switch (label) {
+        case SDL_GAMEPAD_BUTTON_LABEL_A:
+        case SDL_GAMEPAD_BUTTON_LABEL_CROSS:
+            return 0;
+        case SDL_GAMEPAD_BUTTON_LABEL_B:
+        case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE:
+            return 1;
+        case SDL_GAMEPAD_BUTTON_LABEL_X:
+        case SDL_GAMEPAD_BUTTON_LABEL_SQUARE:
+            return 2;
+        case SDL_GAMEPAD_BUTTON_LABEL_Y:
+        case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE:
+            return 3;
+        default:
+            return static_cast<uint8_t>(p);
+    }
+}
+
+void read_face_labels(SDL_Gamepad* pad, uint8_t out[4]) {
+    for (int p = 0; p < 4; ++p) {
+        out[p] = face_code(SDL_GetGamepadButtonLabel(pad, kFaceButtons[p]), p);
+    }
+}
+
+// Maps SDL's controller type to the families the prompt feature knows; anything else (standard, unknown, virtual...) is Other.
+input::PadKind pad_kind(SDL_Gamepad* pad) {
+    switch (SDL_GetGamepadType(pad)) {
+        case SDL_GAMEPAD_TYPE_XBOX360:
+        case SDL_GAMEPAD_TYPE_XBOXONE:
+            return input::PadKind::Xbox;
+        case SDL_GAMEPAD_TYPE_PS3:
+        case SDL_GAMEPAD_TYPE_PS4:
+        case SDL_GAMEPAD_TYPE_PS5:
+            return input::PadKind::PlayStation;
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+            return input::PadKind::Switch;
+        case SDL_GAMEPAD_TYPE_STEAM:
+            return input::PadKind::Steam;
+        default:
+            // Valve's second-generation Steam Controller: not sure SDL tags it SDL_GAMEPAD_TYPE_STEAM, so go by the vendor id as well.
+            if (SDL_GetGamepadVendor(pad) == 0x28DE) return input::PadKind::Steam;
+            return input::PadKind::Other;
+    }
+}
+
+const char* pad_kind_name(input::PadKind k) {
+    switch (k) {
+        case input::PadKind::Xbox: return "Xbox";
+        case input::PadKind::PlayStation: return "PlayStation";
+        case input::PadKind::Switch: return "Switch";
+        case input::PadKind::Steam: return "Steam";
+        default: return "other";
+    }
+}
+
+// Opens a gamepad that SDL reports as added and fills its info entry.
+void gamepad_opened(SDL_JoystickID id, uint64_t ts) {
+    for (const OpenPad& p : g_pads) {
+        if (p.id == id) return;  // duplicate notification for a pad already open
+    }
+    SDL_Gamepad* pad = SDL_OpenGamepad(id);
+    if (!pad) {
+        NXLOG_W(kTag, "gamepad %u: open failed: %s", static_cast<unsigned>(id), SDL_GetError());
+        return;
+    }
+    g_pads.push_back({id, pad});
+
+    input::GamepadInfo info;
+    info.id = id;
+    const char* name = SDL_GetGamepadName(pad);
+    const char* shown = name ? name : "unknown";
+    const size_t n = std::strlen(shown) < sizeof info.name - 1 ? std::strlen(shown) : sizeof info.name - 1;
+    std::memcpy(info.name, shown, n);
+    const SDL_PropertiesID props = SDL_GetGamepadProperties(pad);
+    info.rumble = props != 0 && SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+    info.gyro = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO);
+    info.kind = pad_kind(pad);
+    info.player = SDL_GetGamepadPlayerIndex(pad);
+    input::gamepad_set_info(info);
+
+    NXLOG_I(kTag, "gamepad %u added: \"%s\" kind=%s rumble=%d gyro=%d player=%d", static_cast<unsigned>(id), info.name,
+            pad_kind_name(info.kind), info.rumble ? 1 : 0, info.gyro ? 1 : 0, info.player + 1);
+    // Motion sensors: enabled when the pad has them, skipped silently when it does not.
+    const bool accel_on =
+        SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
+    const bool gyro_on = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+    uint8_t labels[4] = {0, 1, 2, 3};
+    read_face_labels(pad, labels);
+    NXLOG_I(kTag, "gamepad %u sensors: accel=%d gyro=%d labels=%d%d%d%d", static_cast<unsigned>(id), accel_on ? 1 : 0,
+            gyro_on ? 1 : 0, labels[0], labels[1], labels[2], labels[3]);
+
+    input::Event e = make_event(input::EventType::GamepadAdded, ts);
+    e.u.gamepad.id = id;
+    input::queue_push(e);
+}
+
+// Closes a gamepad that SDL reports as removed and drops its info entry.
+void gamepad_closed(SDL_JoystickID id, uint64_t ts) {
+    for (auto it = g_pads.begin(); it != g_pads.end(); ++it) {
+        if (it->id != id) continue;
+        SDL_CloseGamepad(it->pad);
+        g_pads.erase(it);
+        input::gamepad_remove_info(id);
+        NXLOG_I(kTag, "gamepad %u removed", static_cast<unsigned>(id));
+        input::Event e = make_event(input::EventType::GamepadRemoved, ts);
+        e.u.gamepad.id = id;
+        input::queue_push(e);
+        return;
+    }
+}
+
+#ifdef _WIN32
+// Bit n set = XInput user slot n has a pad. xinput1_4 is loaded through SDL, so this file needs no windows.h.
+uint32_t xinput_slots() {
+    using GetState = unsigned long (*)(unsigned long, void*);
+    static GetState get = [] {
+        SDL_SharedObject* lib = SDL_LoadObject("xinput1_4.dll");
+        return lib ? reinterpret_cast<GetState>(SDL_LoadFunction(lib, "XInputGetState")) : nullptr;
+    }();
+    uint32_t mask = 0;
+    for (unsigned long slot = 0; get && slot < 4; ++slot) {
+        unsigned char state[32] = {};   // XINPUT_STATE is 16 bytes
+        if (get(slot, state) == 0) mask |= 1u << slot;
+    }
+    return mask;
+}
+
+// SDL only rescans when its backend says a device changed. Under Wine (Proton on SteamOS) nothing says it, so a pad switched off and on
+// again stayed unseen until a restart (#226). So: when the XInput slots change and SDL has reported no gamepad add or remove for two
+// seconds, the gamepad subsystem is restarted, which rescans every backend (the pads present come back as SDL_EVENT_GAMEPAD_ADDED). On
+// Windows SDL reports the change itself within milliseconds, so this never fires there.
+// ponytail: XInput slots only (Xbox pads, the Steam Input virtual pad); a pad Wine shows only as HID still needs a restart.
+void pad_rescan(uint64_t ts) {
+    static Uint64 next_ms = 0;
+    static uint32_t last = ~0u;
+    const Uint64 now = SDL_GetTicks();
+    if (now < next_ms) return;
+    next_ms = now + 1000;
+    const uint32_t slots = xinput_slots();
+    const bool changed = last != ~0u && slots != last;
+    last = slots;
+    if (!changed || !g_gamepads || now - g_last_pad_event_ms < 2000) return;
+    NXLOG_I(kTag, "XInput slots changed and SDL reported nothing: rescanning gamepads");
+    while (!g_pads.empty()) gamepad_closed(g_pads.back().id, ts);
+    SDL_QuitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK);
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)) NXLOG_W(kTag, "gamepad rescan failed: %s", SDL_GetError());
+}
+#endif
+
+// Turns one SDL event into zero or one nxrt input events and updates the quit flag.
+void translate(const SDL_Event& ev) {
+    const uint64_t ts = ev.common.timestamp;
+    switch (ev.type) {
+        case SDL_EVENT_QUIT:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            g_quit = true;
+            input::queue_push(make_event(input::EventType::Quit, ts));
+            break;
+
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP: {
+            input::Event e = make_event(
+                ev.type == SDL_EVENT_KEY_DOWN ? input::EventType::KeyDown : input::EventType::KeyUp, ts);
+            e.flags = static_cast<uint8_t>(ev.key.repeat ? input::kFlagRepeat : 0);
+            e.mods = ev.key.mod;
+            e.u.key.scancode = static_cast<int32_t>(ev.key.scancode);
+            e.u.key.keycode = static_cast<int32_t>(ev.key.key);
+            input::queue_push(e);
+            break;
+        }
+
+        case SDL_EVENT_TEXT_INPUT: {
+            input::Event e = make_event(input::EventType::Text, ts);
+            copy_utf8(e.u.text.utf8, sizeof e.u.text.utf8, ev.text.text);
+            input::queue_push(e);
+            break;
+        }
+
+        case SDL_EVENT_MOUSE_MOTION: {
+            const bool rel = relative_mouse();
+            const float d = pixel_density();
+            input::Event e = make_event(input::EventType::MouseMotion, ts);
+            e.flags = static_cast<uint8_t>((rel ? input::kFlagRelative : 0) | (ev.motion.which == SDL_TOUCH_MOUSEID ? input::kFlagTouch : 0));
+            e.u.motion.dx = ev.motion.xrel;
+            e.u.motion.dy = ev.motion.yrel;
+            e.u.motion.x = ev.motion.x * d;
+            e.u.motion.y = ev.motion.y * d;
+            if (rel) input::mouse_delta_add(ev.motion.xrel, ev.motion.yrel);
+            input::queue_push(e);
+            break;
+        }
+
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP: {
+            const float d = pixel_density();
+            input::Event e = make_event(
+                ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? input::EventType::MouseButtonDown : input::EventType::MouseButtonUp,
+                ts);
+            e.mods = SDL_GetModState();
+            if (ev.button.which == SDL_TOUCH_MOUSEID) e.flags = input::kFlagTouch;
+            e.u.button.button = ev.button.button;
+            e.u.button.clicks = ev.button.clicks;
+            e.u.button.x = ev.button.x * d;
+            e.u.button.y = ev.button.y * d;
+            input::queue_push(e);
+            break;
+        }
+
+        case SDL_EVENT_MOUSE_WHEEL: {
+            input::Event e = make_event(input::EventType::MouseWheel, ts);
+            e.u.wheel.dx = ev.wheel.x;
+            e.u.wheel.dy = ev.wheel.y;
+            input::queue_push(e);
+            break;
+        }
+
+        case SDL_EVENT_GAMEPAD_ADDED:
+            g_last_pad_event_ms = SDL_GetTicks();
+            gamepad_opened(ev.gdevice.which, ts);
+            break;
+
+        case SDL_EVENT_GAMEPAD_REMOVED:
+            g_last_pad_event_ms = SDL_GetTicks();
+            gamepad_closed(ev.gdevice.which, ts);
+            break;
+
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+            input::Event e = make_event(ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? input::EventType::GamepadButtonDown
+                                                                                 : input::EventType::GamepadButtonUp,
+                                        ts);
+            e.u.gpbutton.id = ev.gbutton.which;
+            e.u.gpbutton.button = ev.gbutton.button;
+            input::queue_push(e);
+            break;
+        }
+
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+            input::Event e = make_event(input::EventType::GamepadAxis, ts);
+            e.u.gpaxis.id = ev.gaxis.which;
+            e.u.gpaxis.axis = ev.gaxis.axis;
+            e.u.gpaxis.value = ev.gaxis.value;
+            input::queue_push(e);
+            break;
+        }
+
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: {
+            input::Event e = make_event(input::EventType::WindowResized, ts);
+            e.u.window.w = ev.window.data1;
+            e.u.window.h = ev.window.data2;
+            input::queue_push(e);
+            break;
+        }
+
+        case SDL_EVENT_WINDOW_FOCUS_GAINED:
+            input::queue_push(make_event(input::EventType::WindowFocusGained, ts));
+            break;
+
+        case SDL_EVENT_WINDOW_FOCUS_LOST:
+            input::queue_push(make_event(input::EventType::WindowFocusLost, ts));
+            break;
+
+        case SDL_EVENT_WINDOW_MINIMIZED:
+            input::queue_push(make_event(input::EventType::WindowMinimized, ts));
+            break;
+
+        case SDL_EVENT_WINDOW_RESTORED:
+            input::queue_push(make_event(input::EventType::WindowRestored, ts));
+            break;
+
+        case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+        case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN: {
+            input::Event e = make_event(input::EventType::WindowFullscreenChanged, ts);
+            e.flags = static_cast<uint8_t>(ev.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN ? input::kFlagFullscreen : 0);
+            current_pixel_size(&e.u.window.w, &e.u.window.h);
+            input::queue_push(e);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+}  // namespace
+
+// ---- lifecycle ----------------------------------------------------------------------------------------------------
+
+bool init(const InitOptions& opt) {
+    if (g_inited) return true;
+#if defined(__APPLE__)
+    // SDL loads libvulkan.1.dylib through dyld's search paths, not the executable's, so a window fails with "Failed to load
+    // Vulkan Portability library" although the runtime's own copy (vk_device.cpp: @executable_path/libvulkan.1.dylib) is
+    // right there. Point SDL at that file; a system-wide SDK or an explicit SDL_VULKAN_LIBRARY still wins.
+    if (!std::getenv("SDL_VULKAN_LIBRARY")) {
+        char exe[4096];
+        uint32_t n = sizeof exe;
+        if (::_NSGetExecutablePath(exe, &n) == 0) {
+            char real[4096];
+            const char* dir = ::realpath(exe, real) ? real : exe;
+            std::string lib(dir);
+            const size_t slash = lib.find_last_of('/');
+            lib.erase(slash == std::string::npos ? 0 : slash);
+            lib += "/libvulkan.1.dylib";
+            if (::access(lib.c_str(), R_OK) == 0) ::setenv("SDL_VULKAN_LIBRARY", lib.c_str(), 1);
+        }
+    }
+#endif
+#if defined(__linux__)
+    // Steam Input (the Steam Controller, and any pad Steam remaps) only feeds the game's window when Steam can see it, which
+    // it can through X11 (XWayland) but not on a native Wayland surface; SDL 3 picks Wayland first on a compositor such as
+    // KDE Plasma 6, and the pad goes silent. Steam sets SteamGameId
+    // for its own games and non-Steam shortcuts alike. A hint only: SDL_VIDEO_DRIVER from the player still wins.
+    if (std::getenv("SteamGameId") || std::getenv("SteamAppId")) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
+#endif
+    // Hints must be set before SDL_Init. Raw, unaccelerated relative mouse; gamepads keep reporting when the window is
+    // in the background.
+    SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SPEED_SCALE, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifdef _WIN32
+    // With libusb-1.0.dll beside the exe (#522) SDL_Init opens libusb and reads the descriptors of every USB device; on some PCs one
+    // never answers and the game hung before its window (frame count 0). On Windows SDL needs libusb only for Nintendo's own
+    // devices (SDL_libusb_required: the GameCube adapter, the Switch 2 Joy-Con, Pro and GameCube controllers), so libusb is loaded
+    // only when a Nintendo USB device is plugged in at start. SDL_HIDAPI_LIBUSB in the environment still wins (SDL: an env var
+    // beats a normal-priority hint).
+    // ponytail: read once at start; a Nintendo pad plugged in later over USB needs a restart to be seen through libusb.
+    SDL_SetHint(SDL_HINT_HIDAPI_LIBUSB, nxrt::host_usb_vendor_present(0x057e) ? "1" : "0");
+#endif
+
+    SDL_InitFlags flags = SDL_INIT_VIDEO | SDL_INIT_EVENTS;
+    if (opt.gamepads) flags |= SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD;
+    if (!SDL_Init(flags)) {
+        NXLOG_E(kTag, "SDL_Init failed: %s", SDL_GetError());
+        return false;
+    }
+    g_inited = true;
+    g_quit = false;
+    g_gamepads = opt.gamepads;
+    const int v = SDL_GetVersion();
+    const char* video = SDL_GetCurrentVideoDriver();   // wayland or x11 decides what the window system can say about HDR
+    NXLOG_I(kTag, "SDL %d.%d.%d initialised (video %s, gamepads %s)", SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v),
+            SDL_VERSIONNUM_MICRO(v), video ? video : "none", opt.gamepads ? "on" : "off");
+    return true;
+}
+
+void shutdown() {
+    if (!g_inited) return;
+    destroy_window();
+    for (const OpenPad& p : g_pads) {
+        SDL_CloseGamepad(p.pad);
+        input::gamepad_remove_info(p.id);
+    }
+    g_pads.clear();
+    SDL_Quit();
+    g_inited = false;
+    NXLOG_I(kTag, "shutdown");
+}
+
+bool initialised() { return g_inited; }
+
+// ---- window -----------------------------------------------------------------------------------------------------
+
+bool create_window(const WindowDesc& desc) {
+    if (!g_inited && !init()) return false;
+    if (g_window) destroy_window();  // one window at a time
+
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (desc.resizable) flags |= SDL_WINDOW_RESIZABLE;
+    if (desc.hidden || config_get_bool("gfx", "hidden", false)) flags |= SDL_WINDOW_HIDDEN;
+
+    g_window = SDL_CreateWindow(desc.title ? desc.title : "nxrt", desc.width, desc.height, flags);
+    if (!g_window) {
+        NXLOG_E(kTag, "SDL_CreateWindow failed: %s", SDL_GetError());
+        return false;
+    }
+    int pw = 0, ph = 0;
+    current_pixel_size(&pw, &ph);
+    NXLOG_I(kTag, "window %dx%d, pixels %dx%d, density %.2f%s", desc.width, desc.height, pw, ph,
+            static_cast<double>(pixel_density()), (flags & SDL_WINDOW_HIDDEN) ? " (hidden)" : "");
+    return true;
+}
+
+void destroy_window() {
+    if (!g_window) return;
+    SDL_DestroyWindow(g_window);
+    g_window = nullptr;
+}
+
+bool has_window() { return g_window != nullptr; }
+
+void* native_window() { return g_window; }
+
+void* native_hwnd() {
+    if (!g_window) return nullptr;
+#if defined(_WIN32)
+    return SDL_GetPointerProperty(SDL_GetWindowProperties(g_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+#else
+    // The Metal view: what a CAMetalLayer is attached to. VK_EXT_metal_surface takes it, and it is the macOS answer to
+    // "the native window handle" that platform.h promises (a CAMetalLayer wraps the NSView SDL created).
+    return SDL_GetPointerProperty(SDL_GetWindowProperties(g_window), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+#endif
+}
+
+void set_window_title(const char* title) {
+    if (g_window && title) SDL_SetWindowTitle(g_window, title);
+}
+
+void pixel_size(int* w, int* h) { current_pixel_size(w, h); }
+
+bool set_window_size(int w, int h) { return g_window != nullptr && SDL_SetWindowSize(g_window, w, h); }
+
+bool minimized() { return window_flag(SDL_WINDOW_MINIMIZED); }
+
+bool focused() { return window_flag(SDL_WINDOW_INPUT_FOCUS); }
+
+bool visible() { return g_window != nullptr && !window_flag(SDL_WINDOW_HIDDEN); }
+
+// ---- fullscreen ---------------------------------------------------------------------------------------------------
+
+bool set_fullscreen(FullscreenMode mode, int w, int h, float hz) {
+    if (!g_window) return false;
+    bool ok = false;
+    switch (mode) {
+        case FullscreenMode::Windowed:
+            ok = SDL_SetWindowFullscreen(g_window, false);
+            break;
+        case FullscreenMode::Borderless:
+            // A NULL mode means "desktop resolution, borderless".
+            ok = SDL_SetWindowFullscreenMode(g_window, nullptr) && SDL_SetWindowFullscreen(g_window, true);
+            break;
+        case FullscreenMode::Exclusive: {
+            const SDL_DisplayID display = SDL_GetDisplayForWindow(g_window);
+            SDL_DisplayMode chosen{};
+            bool found = false;
+            if (w == 0 && h == 0) {
+                const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
+                if (desktop) {
+                    chosen = *desktop;
+                    found = true;
+                }
+            } else {
+                found = SDL_GetClosestFullscreenDisplayMode(display, w, h, hz, true, &chosen);
+            }
+            ok = found && SDL_SetWindowFullscreenMode(g_window, &chosen) && SDL_SetWindowFullscreen(g_window, true);
+            break;
+        }
+    }
+    if (!ok) {
+        NXLOG_W(kTag, "set_fullscreen(%d) refused: %s", static_cast<int>(mode), SDL_GetError());
+        return false;
+    }
+
+    // Wait until SDL reports the new state, pumping events meanwhile (SDL applies it through the event loop).
+    SDL_SyncWindow(g_window);
+    const Uint64 deadline = SDL_GetTicks() + kFullscreenWaitMs;
+    while (fullscreen_mode() != mode && SDL_GetTicks() < deadline) pump_events(true, 20);
+
+    const bool reached = fullscreen_mode() == mode;
+    if (!reached) NXLOG_W(kTag, "set_fullscreen(%d): SDL did not report the new state within %llu ms",
+                          static_cast<int>(mode), static_cast<unsigned long long>(kFullscreenWaitMs));
+    return reached;
+}
+
+FullscreenMode fullscreen_mode() {
+    if (!window_flag(SDL_WINDOW_FULLSCREEN)) return FullscreenMode::Windowed;
+    return SDL_GetWindowFullscreenMode(g_window) ? FullscreenMode::Exclusive : FullscreenMode::Borderless;
+}
+
+float display_refresh_hz() {
+    if (!g_window) return 0.f;
+    const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(g_window));
+    return m ? m->refresh_rate : 0.f;
+}
+
+bool window_hdr(WindowHdr* out) {
+    if (!g_window || !out) return false;
+    const SDL_PropertiesID props = SDL_GetWindowProperties(g_window);
+    out->enabled = SDL_GetBooleanProperty(props, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false);
+    out->headroom = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0f);
+    return true;
+}
+
+// ---- displays -----------------------------------------------------------------------------------------------------
+
+namespace {
+// The display ids in the system's order; empty when SDL has none. The caller frees nothing.
+std::vector<SDL_DisplayID> display_ids() {
+    std::vector<SDL_DisplayID> out;
+    int n = 0;
+    if (SDL_DisplayID* ids = SDL_GetDisplays(&n)) {
+        out.assign(ids, ids + (n > 0 ? n : 0));
+        SDL_free(ids);
+    }
+    return out;
+}
+}  // namespace
+
+int display_count() { return static_cast<int>(display_ids().size()); }
+
+bool display_name(int number, char* out, int cap) {
+    if (!out || cap <= 0) return false;
+    out[0] = ' ';
+    const std::vector<SDL_DisplayID> ids = display_ids();
+    if (number < 1 || number > static_cast<int>(ids.size())) return false;
+    const SDL_DisplayID id = ids[static_cast<size_t>(number - 1)];
+    const char* name = SDL_GetDisplayName(id);
+    const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id);
+    if (m) std::snprintf(out, static_cast<size_t>(cap), "%d: %s (%dx%d @ %.0f Hz)", number, name && *name ? name : "Display", m->w, m->h, static_cast<double>(m->refresh_rate));
+    else std::snprintf(out, static_cast<size_t>(cap), "%d: %s", number, name && *name ? name : "Display");
+    return true;
+}
+
+int window_display() {
+    if (!g_window) return 0;
+    const SDL_DisplayID cur = SDL_GetDisplayForWindow(g_window);
+    const std::vector<SDL_DisplayID> ids = display_ids();
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (ids[i] == cur) return static_cast<int>(i) + 1;
+    return 0;
+}
+
+bool move_to_display(int number) {
+    if (!g_window) return false;
+    const std::vector<SDL_DisplayID> ids = display_ids();
+    if (number < 1 || number > static_cast<int>(ids.size())) return false;
+    const SDL_DisplayID id = ids[static_cast<size_t>(number - 1)];
+    if (SDL_GetDisplayForWindow(g_window) == id) return true;
+    const FullscreenMode mode = fullscreen_mode();
+    if (mode != FullscreenMode::Windowed && !set_fullscreen(FullscreenMode::Windowed)) return false;
+    const bool ok = SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED_DISPLAY(id), SDL_WINDOWPOS_CENTERED_DISPLAY(id));
+    if (!ok) NXLOG_W(kTag, "move_to_display(%d) failed: %s", number, SDL_GetError());
+    SDL_SyncWindow(g_window);
+    if (mode != FullscreenMode::Windowed) set_fullscreen(mode);
+    return ok;
+}
+
+// ---- relative mouse -----------------------------------------------------------------------------------------------
+
+bool set_relative_mouse(bool on) {
+    if (!g_window) return false;
+    if (!SDL_SetWindowRelativeMouseMode(g_window, on)) {
+        NXLOG_W(kTag, "set_relative_mouse(%d) failed: %s", on ? 1 : 0, SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
+bool relative_mouse() { return g_window != nullptr && SDL_GetWindowRelativeMouseMode(g_window); }
+
+// The OS cursor of the window (menus draw it; relative mode hides it by itself). Cheap when nothing changes.
+void set_cursor_visible(bool on) {
+    if (!g_window) return;
+    if (on == SDL_CursorVisible()) return;
+    if (on) SDL_ShowCursor();
+    else SDL_HideCursor();
+}
+
+void set_text_input(bool on) {
+    if (!g_window || SDL_TextInputActive(g_window) == on) return;
+    if (!(on ? SDL_StartTextInput(g_window) : SDL_StopTextInput(g_window))) NXLOG_W(kTag, "set_text_input(%d) failed: %s", on ? 1 : 0, SDL_GetError());
+}
+
+bool relative_mouse_is_raw() {
+    const char* v = SDL_GetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE);
+    return v == nullptr || std::strcmp(v, "0") == 0;
+}
+
+// ---- events -------------------------------------------------------------------------------------------------------
+
+int pump_events(bool wait, int timeout_ms) {
+    if (!g_inited) return 0;
+#ifdef _WIN32
+    pad_rescan(SDL_GetTicksNS());
+#endif
+    SDL_Event ev;
+    int handled = 0;
+    bool have = false;
+    if (wait) {
+        have = timeout_ms < 0 ? SDL_WaitEvent(&ev) : SDL_WaitEventTimeout(&ev, timeout_ms);
+    } else {
+        have = SDL_PollEvent(&ev);
+    }
+    while (have) {
+        ++handled;
+        translate(ev);
+        have = SDL_PollEvent(&ev);
+    }
+    return handled;
+}
+
+bool quit_requested() { return g_quit; }
+
+void clear_quit() { g_quit = false; }
+
+void request_quit() { g_quit = true; }
+
+uint64_t ticks_ns() { return SDL_GetTicksNS(); }
+
+// ---- gamepad polling, sensors and rumble ------------------------------------------------------------------------------
+
+bool gamepad_poll(uint32_t id, GamepadRaw* out) {
+    SDL_Gamepad* pad = find_pad(id);
+    if (!pad || !out) return false;
+    static_assert(SDL_GAMEPAD_AXIS_COUNT == 6, "GamepadRaw::axes holds the six SDL axes");
+    GamepadRaw s;
+    for (int n = 0; n < SDL_GAMEPAD_BUTTON_COUNT && n < 32; ++n) {
+        if (SDL_GetGamepadButton(pad, static_cast<SDL_GamepadButton>(n))) s.buttons |= uint32_t{1} << n;
+    }
+    for (int i = 0; i < SDL_GAMEPAD_AXIS_COUNT; ++i) {
+        s.axes[i] = SDL_GetGamepadAxis(pad, static_cast<SDL_GamepadAxis>(i));
+    }
+    read_face_labels(pad, s.face_label);
+    *out = s;
+    return true;
+}
+
+bool gamepad_sensors(uint32_t id, float accel[3], float gyro[3]) {
+    SDL_Gamepad* pad = find_pad(id);
+    if (!pad || !accel || !gyro) return false;
+    const bool present = SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) && SDL_GamepadSensorEnabled(pad, SDL_SENSOR_ACCEL) &&
+                         SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadSensorEnabled(pad, SDL_SENSOR_GYRO);
+    if (!present) return false;
+    return SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3) &&
+           SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3);
+}
+
+bool gamepad_rumble(uint32_t id, uint16_t low, uint16_t high, uint32_t duration_ms) {
+    SDL_Gamepad* pad = find_pad(id);
+    if (!pad) return false;
+    return SDL_RumbleGamepad(pad, low, high, duration_ms);
+}
+
+// ---- Vulkan -------------------------------------------------------------------------------------------------------
+
+const char* const* vulkan_instance_extensions(uint32_t* count) {
+    if (count) *count = 0;
+    if (!SDL_Vulkan_LoadLibrary(nullptr)) {
+        NXLOG_E(kTag, "SDL_Vulkan_LoadLibrary failed: %s", SDL_GetError());
+        return nullptr;
+    }
+    Uint32 n = 0;
+    const char* const* list = SDL_Vulkan_GetInstanceExtensions(&n);
+    if (count) *count = n;
+    return list;
+}
+
+bool create_vulkan_surface(void* vk_instance, uint64_t* surface_out) {
+    if (!g_window || !vk_instance || !surface_out) return false;
+    VkSurfaceKHR surface = nullptr;
+    if (!SDL_Vulkan_CreateSurface(g_window, static_cast<VkInstance>(vk_instance), nullptr, &surface)) {
+        NXLOG_E(kTag, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+        return false;
+    }
+    *surface_out = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(surface));
+    return true;
+}
+
+void destroy_vulkan_surface(void* vk_instance, uint64_t surface) {
+    if (!vk_instance || !surface) return;
+    SDL_Vulkan_DestroySurface(static_cast<VkInstance>(vk_instance),
+                              reinterpret_cast<VkSurfaceKHR>(static_cast<uintptr_t>(surface)), nullptr);
+}
+
+}  // namespace nxrt::platform

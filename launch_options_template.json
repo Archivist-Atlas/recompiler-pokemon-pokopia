@@ -1,0 +1,51 @@
+{
+  "game_name": "Pokémon Pokopia",
+  "version": "Switch 2 Edition (PC Recomp)",
+  "icon": "game_icon.ico",
+  "icon_png": "game_icon.png",
+  "options": [
+    {
+      "id": "fullscreen",
+      "category": "Affichage & Audio",
+      "env_var": "NXRT_DISPLAY_FULLSCREEN",
+      "on_value": "1",
+      "off_value": "0",
+      "label": "Mode Plein Écran au démarrage (F11 pour basculer)",
+      "description": "Désactivé par défaut (fenêtré 1280x720). En jeu, appuyez sur F11 à tout moment pour basculer en plein écran, F1 pour le menu des options, et Échap pour quitter.",
+      "default": false
+    },
+    {
+      "id": "vsync",
+      "category": "Affichage & Audio",
+      "env_var": "NXRT_DISPLAY_VSYNC",
+      "on_value": "1",
+      "off_value": "0",
+      "label": "Synchronisation verticale (V-Sync)",
+      "description": "Évite le déchirement d'image (screen tearing).",
+      "default": true
+    },
+    {
+      "id": "vk_validation",
+      "category": "Système & Avancé",
+      "env_var": "NXRT_VK_VALIDATION",
+      "on_value": "1",
+      "off_value": "0",
+      "label": "Activer les couches de validation Vulkan (debug)",
+      "description": "Utile uniquement pour diagnostiquer des erreurs graphiques (réduit les FPS).",
+      "default": false
+    }
+  ],
+  "env": {
+    "NXRT_DISPLAY_WIDTH": "1280",
+    "NXRT_DISPLAY_HEIGHT": "720"
+  },
+  "working_dir": "{{INSTALL_DIR}}",
+  "command": [
+    "{{EXE_PATH}}",
+    "--game",
+    "{{INSTALL_DIR}}",
+    "--exefs",
+    "{{INSTALL_DIR}}/exefs",
+    "--window"
+  ]
+}

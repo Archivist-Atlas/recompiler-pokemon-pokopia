@@ -1,0 +1,220 @@
+/*
+ * Design tokens. Every colour, type size, space, radius, shadow and motion value lives here;
+ * layout.css, components.css and pages/<page>.css only reference var(--...).
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* base */
+  --color-bg: #0b0f22;
+  --color-menu: #1b1d38;           /* native select popup */
+  --color-solid: #1a1c36;          /* glass fallback, solid */
+  --color-solid-raised: #24274a;
+
+  /* text */
+  --color-text: #f6f7fc;
+  --color-text-2: rgba(238, 240, 251, 0.76);
+  --color-text-3: rgba(238, 240, 251, 0.56);
+  --color-selection: rgba(126, 232, 193, 0.28);
+
+  /* accent and state */
+  --color-accent: #7ee8c1;
+  --color-accent-hover: #98f1d1;
+  --color-accent-press: #69d9b0;
+  --color-on-accent: #06231a;
+  --color-ok: #7ee8c1;
+  --color-warn: #ffc47e;
+  --color-danger: #ff9095;
+  --color-danger-solid: #d8434c;
+  --color-danger-hover: #e6555e;
+  --color-on-danger: #ffffff;
+  --color-info: #b3c9ff;
+  --color-focus: #e4fff4;
+  --tint-accent: rgba(126, 232, 193, 0.14);
+  --tint-warn: rgba(255, 196, 126, 0.14);
+  --tint-danger: rgba(255, 144, 149, 0.14);
+  --tint-info: rgba(179, 201, 255, 0.14);
+
+  /* surfaces inside glass (no blur: a nested backdrop-filter only sees its parent) */
+  --surface-1: rgba(255, 255, 255, 0.05);
+  --surface-2: rgba(255, 255, 255, 0.09);
+  --surface-3: rgba(255, 255, 255, 0.14);
+  --surface-sunken: rgba(6, 8, 24, 0.34);
+  --line: rgba(255, 255, 255, 0.09);
+  --line-strong: rgba(255, 255, 255, 0.18);
+  --control-off: rgba(255, 255, 255, 0.16);
+  --knob: #ffffff;
+
+  /* glass */
+  --glass-blur: blur(28px) saturate(170%);
+  --glass-surface: rgba(255, 255, 255, 0.06);
+  --glass-tint: rgba(13, 13, 38, 0.42);    /* keeps 4.5:1 text over the bright part of the art */
+  --glass-tint-strong: rgba(13, 13, 38, 0.6);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.13);
+
+  /* art */
+  --art-url: url("./art/island-sharp.webp");
+  --art-soft-url: url("./art/island-soft.webp");
+  --art-position: 62% 58%;
+  --art-soft-bleed: 180px;
+  --scrim-soft: #8a8a8a;            /* multiplied over the blurred art: neutral grey, so it only dims and the page shows the same picture as Home */
+  --hero-x: 300px;                 /* the title's middle: the scrim behind it stops short of the sun */
+  --scrim-hero:
+    linear-gradient(90deg, rgba(7, 10, 30, 0.56) 0%, rgba(7, 10, 30, 0.3) 30%, rgba(7, 10, 30, 0) 50%),
+    radial-gradient(ellipse 285px 270px at var(--hero-x) 57%, rgba(7, 10, 30, 0.6) 0%, rgba(7, 10, 30, 0.48) 50%, rgba(7, 10, 30, 0) 100%),
+    linear-gradient(0deg, rgba(7, 10, 30, 0.72) 0%, rgba(7, 10, 30, 0.16) 30%, rgba(7, 10, 30, 0) 44%);
+  --backdrop: rgba(6, 7, 22, 0.5);
+
+  /* type */
+  --font-ui: "Inter Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", ui-monospace, Consolas, monospace;
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 28px;
+  --text-3xl: 40px;
+  --text-hero: 56px;
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semi: 600;
+  --weight-bold: 700;
+  --leading-tight: 1.2;
+  --leading: 1.5;
+  --tracking-hero: -0.035em;
+  --tracking-title: -0.022em;
+  --tracking-ui: -0.006em;
+
+  /* space */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --space-9: 56px;
+
+  /* radius */
+  --radius-xs: 10px;
+  --radius-sm: 14px;
+  --radius-md: 20px;
+  --radius-lg: 28px;
+  --radius-pill: 999px;
+
+  /* sizes */
+  --sidebar-w: 224px;
+  --rail-w: 68px;
+  --gutter: 12px;
+  --titlebar-h: 44px;
+  --control-h: 36px;
+  --control-sm: 30px;
+  --control-lg: 52px;
+  --icon: 18px;
+  --icon-sm: 15px;
+  --icon-stroke: 1.75;
+
+  /* depth */
+  --shadow-sm: 0 1px 2px rgba(4, 5, 20, 0.4);
+  --shadow-md: 0 8px 24px -8px rgba(4, 5, 20, 0.6);
+  --shadow-lg: 0 24px 60px -16px rgba(4, 5, 20, 0.72), 0 4px 12px -4px rgba(4, 5, 20, 0.4);
+  --shadow-accent: 0 10px 28px -10px rgba(126, 232, 193, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  --shadow-text: 0 2px 40px rgba(7, 10, 30, 0.55), 0 1px 3px rgba(7, 10, 30, 0.3);
+
+  /* motion */
+  --dur: 160ms;
+  --dur-slow: 280ms;
+  --ease: ease;
+  --rise: 6px;
+  --press: 0.98;
+}
+
+@media (max-width: 999.98px) {
+  :root { --hero-x: 190px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur: 0ms;
+    --dur-slow: 0ms;
+    --rise: 0px;
+    --press: 1;
+  }
+}
+
+:root[data-theme="sunrise"] {
+  --art-url: url("./art/island-sharp-sunrise.webp");        /* the amber tint is baked into the pictures: a CSS filter on a full-window layer is repainted on every page change */
+  --art-soft-url: url("./art/island-soft-sunrise.webp");
+  --color-bg: #1c1006;
+  --color-menu: #2e1c0e;
+  --color-solid: #2a190c;
+  --color-solid-raised: #3a2414;
+  --color-selection: rgba(255, 194, 61, 0.3);
+  --color-accent: #ffc23d;
+  --color-accent-hover: #ffd166;
+  --color-accent-press: #f0ae1f;
+  --color-on-accent: #2a1700;
+  --color-ok: #9fd8ff;              /* blue, not green: stays apart from warn and danger for red-green colour blindness */
+  --color-warn: #ffb35c;
+  --color-danger: #ff7a6b;
+  --color-info: #9fd8ff;
+  --color-focus: #fff1c9;
+  --tint-accent: rgba(255, 194, 61, 0.16);
+  --tint-warn: rgba(255, 179, 92, 0.16);
+  --tint-danger: rgba(255, 122, 107, 0.16);
+  --tint-info: rgba(159, 216, 255, 0.14);
+  --surface-sunken: rgba(24, 12, 4, 0.36);
+  --glass-tint: rgba(36, 18, 6, 0.44);
+  --glass-tint-strong: rgba(36, 18, 6, 0.62);
+  --scrim-hero:
+    linear-gradient(90deg, rgba(26, 12, 4, 0.58) 0%, rgba(26, 12, 4, 0.3) 30%, rgba(26, 12, 4, 0) 50%),
+    radial-gradient(ellipse 285px 270px at var(--hero-x) 57%, rgba(26, 12, 4, 0.6) 0%, rgba(26, 12, 4, 0.48) 50%, rgba(26, 12, 4, 0) 100%),
+    linear-gradient(0deg, rgba(26, 12, 4, 0.74) 0%, rgba(26, 12, 4, 0.16) 30%, rgba(26, 12, 4, 0) 44%);
+  --backdrop: rgba(22, 10, 3, 0.52);
+  --shadow-accent: 0 10px 28px -10px rgba(255, 194, 61, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  --shadow-text: 0 2px 40px rgba(26, 12, 4, 0.55), 0 1px 3px rgba(26, 12, 4, 0.3);
+}
+
+/* Koi's Camp (theme id koi): a bright daytime picture (hand-drawn art by Koi) behind the same dark glass; teal-green neutrals, the default mint accent */
+:root[data-theme="koi"] {
+  --art-url: url("./art/koi-sharp.webp");
+  --art-soft-url: url("./art/koi-soft.webp");
+  --art-position: 50% 56%;
+  --color-bg: #08201f;
+  --color-menu: #12332f;
+  --color-solid: #10302c;
+  --color-solid-raised: #1a423d;
+  --surface-sunken: rgba(4, 22, 20, 0.4);
+  --glass-tint: rgba(6, 30, 28, 0.5);               /* a little darker than Dusk: the picture is bright, text must keep 4.5:1 */
+  --glass-tint-strong: rgba(6, 30, 28, 0.68);
+  --scrim-hero:
+    linear-gradient(90deg, rgba(4, 22, 20, 0.66) 0%, rgba(4, 22, 20, 0.36) 32%, rgba(4, 22, 20, 0) 54%),
+    radial-gradient(ellipse 285px 270px at var(--hero-x) 57%, rgba(4, 22, 20, 0.66) 0%, rgba(4, 22, 20, 0.52) 50%, rgba(4, 22, 20, 0) 100%),
+    linear-gradient(0deg, rgba(4, 22, 20, 0.78) 0%, rgba(4, 22, 20, 0.2) 30%, rgba(4, 22, 20, 0) 44%);
+  --backdrop: rgba(4, 22, 20, 0.54);
+  --shadow-text: 0 2px 40px rgba(4, 22, 20, 0.6), 0 1px 3px rgba(4, 22, 20, 0.35);
+}
+
+/* Meadow (theme id meadow): a bright daytime picture (an original scene, art/meadow.svg) behind the same dark glass; teal-green neutrals, the default mint accent */
+:root[data-theme="meadow"] {
+  --art-url: url("./art/meadow-sharp.webp");
+  --art-soft-url: url("./art/meadow-soft.webp");
+  --art-position: 50% 56%;
+  --color-bg: #08201f;
+  --color-menu: #12332f;
+  --color-solid: #10302c;
+  --color-solid-raised: #1a423d;
+  --surface-sunken: rgba(4, 22, 20, 0.4);
+  --glass-tint: rgba(6, 30, 28, 0.5);               /* a little darker than Dusk: the picture is bright, text must keep 4.5:1 */
+  --glass-tint-strong: rgba(6, 30, 28, 0.68);
+  --scrim-hero:
+    linear-gradient(90deg, rgba(4, 22, 20, 0.66) 0%, rgba(4, 22, 20, 0.36) 32%, rgba(4, 22, 20, 0) 54%),
+    radial-gradient(ellipse 285px 270px at var(--hero-x) 57%, rgba(4, 22, 20, 0.66) 0%, rgba(4, 22, 20, 0.52) 50%, rgba(4, 22, 20, 0) 100%),
+    linear-gradient(0deg, rgba(4, 22, 20, 0.78) 0%, rgba(4, 22, 20, 0.2) 30%, rgba(4, 22, 20, 0) 44%);
+  --backdrop: rgba(4, 22, 20, 0.54);
+  --shadow-text: 0 2px 40px rgba(4, 22, 20, 0.6), 0 1px 3px rgba(4, 22, 20, 0.35);
+}

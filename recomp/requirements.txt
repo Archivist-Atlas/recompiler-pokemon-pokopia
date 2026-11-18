@@ -1,0 +1,5 @@
+# Python 3.13 in tools\.venv (from the repository root):
+# uv venv tools\.venv --python 3.13
+# uv pip install --python tools\.venv -r recomp\requirements.txt
+capstone==5.0.9     # instruction decode for the tier-2 lifter and jump tables
+lz4                 # NSO segment decompression (nxrecomp/nso.py)

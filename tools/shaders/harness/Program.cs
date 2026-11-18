@@ -1,0 +1,667 @@
+// spirv_harness: run Ryujinx's Maxwell shader translator offline on blocks extracted by tools/maxwell/containers.py.
+//
+//   spirv_harness <code.bin> <ctrl.bin> [-o out.spv] [--glsl]
+//       one stage: code block + NVN control section as written by containers.py --extract
+//       (--glsl: Vulkan GLSL text instead of SPIR-V, to read what the translator made or compare backends)
+//   spirv_harness --batch <extracted dir> --out <dir> [--jobs 2] [--limit N] [--no-val] [--no-retry] [--debug-mode] [--target-env vulkan1.3] [--host desktop|moltenvk]
+//       every distinct code block named in any manifest.tsv under <extracted dir>; writes <hash>.spv, results.tsv
+//       (one line per block) and summary.txt (counts, exceptions and translator messages grouped by text)
+//
+// Everything this program learns about the block comes from the control section (see docs/nvn/SHADERS.md):
+// +0x708 program start (0x30 graphics, 0x100 compute), +0x6fc/+0x700 constant data size/offset. The stage comes
+// from the SPH inside the code (graphics) or from the NVN header magic (0x12345679 = compute).
+
+using Nx.Shaders.Ampere;
+using Ryujinx.Graphics.Shader;
+using Ryujinx.Graphics.Shader.Translation;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace SpirvHarness
+{
+    // CodePath, CtrlPath, GlslcPath: Blobs (a file, or a slice of a corpus pack)
+    sealed record Job(string Hash, string Group, string CodePath, string CtrlPath, int Stages, string GlslcPath = null);
+
+    sealed class Result
+    {
+        public string Hash, Group, Stage = "?", Status = "?", Error = "", ValError = "";
+        public int Stages, SpvBytes;
+        public double Ms;
+        public List<string> Messages = new();
+        public string Resources = "";
+        public string Queries = "";
+        public string Reflection = "";
+        public List<string> Unsupported = new();
+    }
+
+    static class Program
+    {
+        const uint ComputeMagic = 0x12345679;
+        static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
+        static bool NoRetry;   // --no-retry: report attempt 1 only (the translator as Ryujinx runs it)
+        static bool Debug;     // --debug-mode: DebugMode from attempt 1 (also reports undecodable opcodes)
+
+        static readonly Dictionary<string, string> GlslcByHash = new();   // --reflect <corpus>: code hash -> GLSLC output
+
+        /// NVN2 (Switch 2) control section: magic 0x98761234, version 201 (docs/AMPERE.md section 3).
+        public static bool IsNvn2(byte[] ctrl) => ctrl != null && ctrl.Length >= 0xd8 && BitConverter.ToUInt32(ctrl, 0) == 0x98761234 && BitConverter.ToUInt32(ctrl, 4) == 201;
+
+        const string Usage =
+            "usage: spirv_harness <code.bin> <ctrl.bin> [-o out.spv] [--glsl] [--glslc <GLSLC output, NVN2>]\n" +
+            "       spirv_harness --batch <extracted dir> --out <dir> [--jobs N] [--limit N] [--no-val] [--no-retry] [--debug-mode] [--target-env E] [--host desktop|moltenvk] [--spirv-val PATH] [--reflect <Ampere corpus>]\n" +
+            "       spirv_harness --serve --out <dir> [--jobs N] [--no-val] ...: --batch for each corpus folder named on stdin, one per line";
+
+        static int Main(string[] args)
+        {
+            // --help on stdout and exit 0, so a packaging check can prove the published binary starts (the usage below, for a
+            // missing or wrong argument, goes to stderr with exit 2, which is a failure).
+            if (args.Contains("--help") || args.Contains("-h"))
+            {
+                Console.WriteLine(Usage);
+                return 0;
+            }
+            NoRetry = args.Contains("--no-retry");
+            StaticGpuAccessor.DesktopHost = Opt(args, "--host", "desktop") != "moltenvk";
+            Debug = args.Contains("--debug-mode");
+            // --out first: the launcher reads ErrorFile there when this run fails (under Proton stdout and stderr never reach it)
+            string outDir = Opt(args, "--out", null);
+            // A crash on any thread (a worker of Parallel.ForEach included) still writes ErrorFile before the process goes.
+            AppDomain.CurrentDomain.UnhandledException += (_, e) => Fail(outDir, $"unhandled exception: {e.ExceptionObject}");
+            try
+            {
+                if (outDir != null) Directory.CreateDirectory(outDir);
+                ProgressDir = outDir;
+                Progress($"started: .NET {Environment.Version}, {(GCSettings.IsServerGC ? "server" : "workstation")} GC, " +
+                         $"{Environment.ProcessorCount} processors, {GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >> 20} MiB for the GC; " +
+                         $"arguments: {string.Join(' ', args)}");
+                if (args.Length >= 2 && args[0] == "--batch") return Batch(args);
+                if (args.Length >= 2 && args[0] == "--serve") return Serve(args);
+                if (args.Length >= 2 && !args[0].StartsWith("-")) return Single(args);
+            }
+            catch (ArgumentException e)
+            {
+                Fail(outDir, $"{e.GetType().Name}: {e.Message}\n{e.StackTrace}");
+            }
+            catch (Exception e)
+            {
+                Fail(outDir, e.ToString());
+                return 3;
+            }
+            Fail(outDir, $"arguments: {string.Join(' ', args)}\n" + Usage);
+            return 2;
+        }
+
+        /// Written to --out when a run fails; the launcher puts it in setup.log.
+        public const string ErrorFile = "harness_error.txt";
+
+        /// Written to --out as a run goes (start, blocks loaded, first block, every 500, done). A process that dies without a word
+        /// (killed, or a runtime fail-fast: #530 under Proton) leaves its last step here; the launcher puts the tail in setup.log.
+        public const string ProgressFile = "harness_progress.txt";
+        static string ProgressDir;
+        static readonly Stopwatch Started = Stopwatch.StartNew();
+        static readonly object ProgressLock = new();
+
+        static void Progress(string text)
+        {
+            if (ProgressDir == null) return;
+            try
+            {
+                lock (ProgressLock)
+                    File.AppendAllText(Path.Combine(ProgressDir, ProgressFile), $"{Started.Elapsed.TotalSeconds:F1} s  {text}\n");
+            }
+            catch (Exception)
+            {
+                // a progress note never stops a run
+            }
+        }
+
+        // A failure to stderr, and (appended) to <out>/ErrorFile when there is an --out.
+        static void Fail(string outDir, string text)
+        {
+            Console.Error.WriteLine(text);
+            if (outDir == null) return;
+            try
+            {
+                Directory.CreateDirectory(outDir);
+                File.AppendAllText(Path.Combine(outDir, ErrorFile), text + "\n");
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine($"cannot write {ErrorFile} in {outDir}: {e.Message}");
+            }
+        }
+
+        // spirv-val: $VULKAN_SDK\Bin, else the PATH.
+        static string FindSpirvVal()
+        {
+            string exe = OperatingSystem.IsWindows() ? "spirv-val.exe" : "spirv-val";
+            string sdk = Environment.GetEnvironmentVariable("VULKAN_SDK");
+            if (!string.IsNullOrEmpty(sdk) && File.Exists(Path.Combine(sdk, "Bin", exe))) return Path.Combine(sdk, "Bin", exe);
+            return exe;
+        }
+
+        static string Opt(string[] args, string name, string def)
+        {
+            int i = Array.IndexOf(args, name);
+            return i >= 0 && i + 1 < args.Length ? args[i + 1] : def;
+        }
+
+        static int Single(string[] args)
+        {
+            bool glsl = args.Contains("--glsl");
+            string output = Opt(args, "-o", Path.ChangeExtension(args[0], glsl ? ".glsl" : ".spv"));
+            string glslcPath = Opt(args, "--glslc", null);
+            Result r = Translate(File.ReadAllBytes(args[0]), File.ReadAllBytes(args[1]), out byte[] spv, glsl, glslcPath);
+            if (spv != null) File.WriteAllBytes(output, spv);
+            Console.WriteLine($"{r.Stage} {r.Status} {r.SpvBytes} bytes {r.Ms:F1} ms -> {(spv != null ? output : "-")}");
+            Console.WriteLine($"resources: {r.Resources}");
+            foreach (string m in r.Messages) Console.WriteLine($"translator: {m}");
+            foreach (string m in r.Unsupported) Console.WriteLine($"unsupported: {m}");
+            if (r.Reflection != "") Console.WriteLine($"glslc reflection: {r.Reflection}");
+            if (r.Error != "") Console.WriteLine($"error: {r.Error}");
+            return spv != null ? 0 : 1;
+        }
+
+        // One code block through the translator. Never throws: failures are recorded in the result.
+        static Result Translate(byte[] code, byte[] ctrl, out byte[] spv, bool glsl = false, string glslcPath = null)
+        {
+            if (IsNvn2(ctrl)) return TranslateNvn2(code, ctrl, out spv, glsl, glslcPath);
+            Result r = new();
+            spv = null;
+            int start = BitConverter.ToInt32(ctrl, 0x708);
+            int constSize = BitConverter.ToInt32(ctrl, 0x6fc);
+            int constOff = BitConverter.ToInt32(ctrl, 0x700);
+            bool compute = BitConverter.ToUInt32(code, 0) == ComputeMagic ||
+                           (ctrl.Length >= 0x718 && BitConverter.ToUInt32(ctrl, 0x714) == 5);   // NVN stage 5 (also set by dksh_to_corpus.py)
+            // SPH word 0 bits 10..13. Used here for binding ranges only; the translator reads the SPH itself.
+            int sphType = compute ? 0 : (BitConverter.ToInt32(code, start) >> 10) & 0xf;
+            // SPH types: 0/1 vertex (A / B), 2 tessellation control, 3 tessellation evaluation, 4 geometry, 5 pixel.
+            ShaderStage stage = compute ? ShaderStage.Compute : sphType switch
+            {
+                5 => ShaderStage.Fragment,
+                4 => ShaderStage.Geometry,
+                2 => ShaderStage.TessellationControl,
+                3 => ShaderStage.TessellationEvaluation,
+                _ => ShaderStage.Vertex,
+            };
+            r.Stage = stage.ToString().ToLowerInvariant();
+
+            Stopwatch sw = Stopwatch.StartNew();
+            // Attempt 1: normal translation. Attempt 2 (only after an exception, SPIR-V only, unless NoRetry):
+            // DebugMode, which turns off the translator's expression propagation. That pass folds the temporaries
+            // Ryujinx creates for SPIR-V call arguments back into the call, and the SPIR-V backend then throws in
+            // GenerateCall (see docs/nvn/TRANSLATOR.md, "Failures"). Status "ok-retry" = translated by attempt 2.
+            for (int attempt = 1; attempt <= (glsl || NoRetry ? 1 : 2); attempt++)
+            {
+                StaticGpuAccessor gpu = new(code, constOff, constSize, stage, ctrl);
+                TranslationFlags flags = (compute ? TranslationFlags.Compute : TranslationFlags.None) |
+                                         (attempt == 2 || Debug ? TranslationFlags.DebugMode : TranslationFlags.None);
+                TranslationOptions options = new(glsl ? TargetLanguage.Glsl : TargetLanguage.Spirv, TargetApi.Vulkan, flags);
+                try
+                {
+                    ShaderProgram program = Translator.CreateContext((ulong)start, gpu, options).Translate();
+                    spv = glsl ? Encoding.UTF8.GetBytes(program.Code) : program.BinaryCode;
+                    if (!glsl && spv != null && program.Info.Images.Count > 0) spv = AddImageWithoutFormatCapabilities(spv);
+                    if (!glsl && spv != null) spv = AddMissingBuiltInCapabilities(spv);
+                    r.SpvBytes = spv?.Length ?? 0;
+                    r.Status = spv == null ? "no-output" : attempt == 1 ? "ok" : "ok-retry";
+                    r.Resources = DescribeResources(program.Info);
+                }
+                catch (Exception e)
+                {
+                    r.Status = "exception";
+                    r.Error = $"{e.GetType().Name}: {e.Message}";
+                    string frame = e.StackTrace?.Split('\n').FirstOrDefault(l => l.Contains("Ryujinx.Graphics.Shader"))?.Trim();
+                    if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in (/|[A-Za-z]:\\).*", "")}";
+                }
+                lock (gpu.Messages) r.Messages = gpu.Messages.Distinct().ToList();
+                r.Queries = string.Join(',', gpu.DrawTimeQueries);
+                if (r.Status != "exception") break;
+            }
+            r.Ms = sw.Elapsed.TotalMilliseconds;
+            return r;
+        }
+
+        // One NVN2 (Switch 2, Ampere SM86) block: control section +0x38 program end, +0x3c/+0x40 constant data size/offset,
+        // +0x56 stage (0 vs, 1 ps, 2 gs, 3 tcs, 4 tes, 5 cs). Graphics code starts with a 0x80-byte SPH v4, compute has
+        // none. The SASS is decoded by tools/shaders/ampere/decoder and emitted into Ryujinx's IR by the Ampere front end
+        // (tools/shaders/ampere/frontend); from there on it is Ryujinx's translator as for Maxwell. A block with any
+        // instruction form the front end does not handle gets status "unsupported" and no SPIR-V.
+        static Result TranslateNvn2(byte[] code, byte[] ctrl, out byte[] spv, bool glsl, string glslcPath)
+        {
+            Result r = new();
+            spv = null;
+            int nvnStage = BitConverter.ToUInt16(ctrl, 0x56);
+            int progEnd = BitConverter.ToInt32(ctrl, 0x38);
+            int constSize = BitConverter.ToInt32(ctrl, 0x3c), constOff = BitConverter.ToInt32(ctrl, 0x40);
+            ShaderStage stage = nvnStage switch
+            {
+                0 => ShaderStage.Vertex, 1 => ShaderStage.Fragment, 2 => ShaderStage.Geometry,
+                3 => ShaderStage.TessellationControl, 4 => ShaderStage.TessellationEvaluation, _ => ShaderStage.Compute,
+            };
+            bool compute = stage == ShaderStage.Compute;
+            r.Stage = stage.ToString().ToLowerInvariant();
+            int start = compute ? 0 : 0x80;
+            int end = Math.Min(progEnd, code.Length) & ~0xf;
+            while (end - 16 >= start && code.AsSpan(end - 16, 16).IndexOfAnyExcept((byte)0) < 0) end -= 16;
+            if (nvnStage > 5 || end <= start)
+            {
+                r.Status = "exception";
+                r.Error = $"NVN2 block without code (stage {nvnStage}, program end 0x{progEnd:x}, code 0x{code.Length:x} bytes)";
+                return r;
+            }
+            Nvn2Reflection refl = glslcPath != null && Blobs.Exists(glslcPath) ? Nvn2Reflection.Read(glslcPath) : null;
+            if (refl != null) r.Reflection = refl.Describe(nvnStage);
+
+            Stopwatch sw = Stopwatch.StartNew();
+            IReadOnlyList<SassInst> insts = SassDecoder.DecodeBlock(code, start, end);
+            for (int attempt = 1; attempt <= (glsl || NoRetry ? 1 : 2); attempt++)
+            {
+                // Address 0 of the accessor's code is the SPH (graphics) or the first instruction (compute); the constant
+                // data offset (+0x40) is from the start of the code area in both cases.
+                StaticGpuAccessor gpu = new(code, constOff, constSize, stage, ctrl);
+                if (refl != null) foreach (var h in refl.BufferTextureHandles(nvnStage, ctrl)) gpu.BufferTextures.Add(h);
+                else foreach (var h in BufferFetchHandles(insts, compute)) gpu.BufferTextures.Add(h);
+                TranslationFlags flags = (compute ? TranslationFlags.Compute : TranslationFlags.None) |
+                                         (attempt == 2 || Debug ? TranslationFlags.DebugMode : TranslationFlags.None);
+                TranslationOptions options = new(glsl ? TargetLanguage.Glsl : TargetLanguage.Spirv, TargetApi.Vulkan, flags);
+                AmpereProgram prog = null;
+                try
+                {
+                    TranslatorContext tctx = AmpereTranslator.CreateContext(gpu, options, insts, out prog);
+                    ShaderProgram sp = tctx.Translate();
+                    if (prog.Unsupported.Count == 0)
+                    {
+                        spv = glsl ? Encoding.UTF8.GetBytes(sp.Code) : sp.BinaryCode;
+                        if (!glsl && spv != null && sp.Info.Images.Count > 0) spv = AddImageWithoutFormatCapabilities(spv);
+                        if (!glsl && spv != null) spv = AddMissingBuiltInCapabilities(spv);
+                        r.SpvBytes = spv?.Length ?? 0;
+                        r.Status = spv == null ? "no-output" : attempt == 1 ? "ok" : "ok-retry";
+                        r.Resources = DescribeResources(sp.Info);
+                        if (refl != null) lock (gpu.Messages) gpu.Messages.AddRange(refl.Check(nvnStage, sp.Info));
+                    }
+                }
+                catch (Exception e)
+                {
+                    r.Status = "exception";
+                    r.Error = $"{e.GetType().Name}: {e.Message}";
+                    string frame = e.StackTrace?.Split('\n').FirstOrDefault(l => l.Contains("Ryujinx.Graphics.Shader"))?.Trim();
+                    if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in (/|[A-Za-z]:\\).*", "")}";
+                }
+                if (prog != null && prog.Unsupported.Count > 0)
+                {
+                    r.Status = "unsupported";
+                    r.Unsupported = prog.Unsupported.ToList();
+                    r.Error = "unsupported: " + string.Join("; ", r.Unsupported.Take(8)) + (r.Unsupported.Count > 8 ? $"; ... {r.Unsupported.Count - 8} more" : "");
+                    r.SpvBytes = 0;
+                    spv = null;
+                }
+                lock (gpu.Messages) r.Messages = gpu.Messages.Distinct().ToList();
+                r.Queries = string.Join(',', gpu.DrawTimeQueries);
+                if (r.Status != "exception") break;
+            }
+            r.Ms = sw.Elapsed.TotalMilliseconds;
+            return r;
+        }
+
+        // Blocks without a GLSLC reflection (the ones only the runtime dumped): a plain 1D TLD (no array, LOD, offset or
+        // multisample) is taken as a buffer texture fetch, as Ryujinx does for bindless 1D fetches. In the 99,012 reflected
+        // blocks every handle read that way is a buffer sampler (the game has no 1D textures).
+        static IEnumerable<(int Slot, int Handle)> BufferFetchHandles(IReadOnlyList<SassInst> insts, bool compute)
+        {
+            foreach (SassInst i in insts)
+            {
+                if (i.Opcode != "TLD" || i.Mods.Any(m => m is "LL" or "AOFFI" or "MS")) continue;
+                var o = i.Operands;
+                if (!o.Any(x => x.Kind == OperandKind.Other && x.Text == "1D")) continue;
+                var imms = o.Where(x => x.Kind == OperandKind.Imm).ToList();
+                if (imms.Count < 2) continue;
+                int bank = (int)imms[0].ImmBits, handle = (int)imms[1].ImmBits;
+                if (bank == 2) { yield return (-1, handle); yield return (2, handle); }
+                else yield return (bank, handle);
+            }
+        }
+
+        // Ryujinx declares storage images without a format when the host can load/store them that way (MoltenVK can:
+        // shaderStorageImageRead/WriteWithoutFormat), but never adds the two capabilities SPIR-V requires for it.
+        // Insert "OpCapability StorageImageReadWithoutFormat / WriteWithoutFormat" right after the 5-word header;
+        // capabilities come first in a module, so that is a valid position.
+        static byte[] AddImageWithoutFormatCapabilities(byte[] spv)
+        {
+            const uint OpCapability = 17, ReadWithoutFormat = 55, WriteWithoutFormat = 56;
+            uint[] extra = [(2u << 16) | OpCapability, ReadWithoutFormat, (2u << 16) | OpCapability, WriteWithoutFormat];
+            byte[] result = new byte[spv.Length + extra.Length * 4];
+            Array.Copy(spv, result, 20);
+            Buffer.BlockCopy(extra, 0, result, 20, extra.Length * 4);
+            Array.Copy(spv, 20, result, 20 + extra.Length * 4, spv.Length - 20);
+            return result;
+        }
+
+        // Ryujinx's SPIR-V back end declares ViewportIndex as a geometry-shader output (or fragment input) without
+        // OpCapability MultiViewport, which spirv-val rejects (docs/debug/001.md). Insert it after the header.
+        static byte[] AddMissingBuiltInCapabilities(byte[] spv)
+        {
+            const uint OpCapability = 17, OpDecorate = 71, DecorationBuiltIn = 11, BuiltInViewportIndex = 10;
+            const uint MultiViewport = 57, ShaderViewportIndex = 70, ShaderViewportIndexLayerEXT = 5254;
+            // Over the bytes in place: a copy of every module just to look for two words was 26 GB of large-object allocation
+            // over a 99,012-block corpus, and each one was collected in gen 2.
+            ReadOnlySpan<uint> w = MemoryMarshal.Cast<byte, uint>(spv);
+            bool viewportIndex = false, haveCap = false;
+            for (int i = 5; i < w.Length;)
+            {
+                uint op = w[i] & 0xffff, len = w[i] >> 16;
+                if (len == 0) break;
+                if (op == OpCapability && (w[i + 1] == MultiViewport || w[i + 1] == ShaderViewportIndex || w[i + 1] == ShaderViewportIndexLayerEXT)) haveCap = true;
+                if (op == OpDecorate && len >= 4 && w[i + 2] == DecorationBuiltIn && w[i + 3] == BuiltInViewportIndex) viewportIndex = true;
+                i += (int)len;
+            }
+            if (!viewportIndex || haveCap) return spv;
+            uint[] extra = [(2u << 16) | OpCapability, MultiViewport];
+            byte[] result = new byte[spv.Length + extra.Length * 4];
+            Array.Copy(spv, result, 20);
+            Buffer.BlockCopy(extra, 0, result, 20, extra.Length * 4);
+            Array.Copy(spv, 20, result, 20 + extra.Length * 4, spv.Length - 20);
+            return result;
+        }
+
+        // Compact description of what the shader binds, in Maxwell terms and in Vulkan terms:
+        //   cb<slot>=s<set>b<binding>            constant buffer c[slot]
+        //   sb[c<slot>+0x<off>]=s<set>b<binding> storage buffer whose address the shader loads from c[slot][off]
+        //   tex<type>[c<slot>:<handle>]=s<set>b<binding>  texture whose handle is word <handle> of c[slot]
+        static string DescribeResources(ShaderProgramInfo info)
+        {
+            List<string> parts = new();
+            foreach (BufferDescriptor b in info.CBuffers) parts.Add($"cb{b.Slot}=s{b.Set}b{b.Binding}");
+            foreach (BufferDescriptor b in info.SBuffers) parts.Add($"sb[c{b.SbCbSlot}+0x{b.SbCbOffset:x}]=s{b.Set}b{b.Binding}");
+            foreach (TextureDescriptor t in info.Textures)
+                parts.Add($"tex{t.Type}[c{t.CbufSlot}:{t.HandleIndex}{(t.ArrayLength > 1 ? $"x{t.ArrayLength}" : "")}]=s{t.Set}b{t.Binding}");
+            foreach (TextureDescriptor t in info.Images)
+                parts.Add($"img{t.Type}[c{t.CbufSlot}:{t.HandleIndex}{(t.ArrayLength > 1 ? $"x{t.ArrayLength}" : "")}]=s{t.Set}b{t.Binding}");
+            return string.Join(' ', parts).Replace(", ", "|");
+        }
+
+        // All distinct code blocks under the extraction root (one manifest.tsv per extracted container).
+        static List<Job> LoadJobs(string root)
+        {
+            Dictionary<string, Job> jobs = new();
+            // Ampere corpus layout (tools/shaders/ampere/extract_corpus.py): unique.tsv, and the blocks either in pack/<NN>.code,
+            // .ctrl, .glslc (--layout packs: unique.tsv has code_ref, ctrl_ref, glslc_ref = "<NN>:<offset>:<length>") or in
+            // code/<h>.bin, ctrl/<h>.bin, glslc/<h>.bin (--layout files, and corpora extracted before the packs).
+            string unique = Path.Combine(root, "unique.tsv");
+            if (File.Exists(unique) && (Directory.Exists(Path.Combine(root, "code")) || Directory.Exists(Path.Combine(root, "pack"))))
+            {
+                foreach (var row in ReadTsv(unique))
+                {
+                    string h = row["code_sha1_16"];
+                    jobs[h] = new Job(h, row["stage"], CorpusBlob(root, row, "code_ref", "code", h), CorpusBlob(root, row, "ctrl_ref", "ctrl", row["first_ctrl"]),
+                                      int.Parse(row["occurrences"]), CorpusBlob(root, row, "glslc_ref", "glslc", row["first_glslc"]));
+                }
+                return jobs.Values.ToList();
+            }
+            if (!Directory.Exists(root)) throw new DirectoryNotFoundException($"the shader corpus folder does not exist: {root}");
+            foreach (string manifest in Directory.EnumerateFiles(root, "manifest.tsv", SearchOption.AllDirectories)
+                                                .OrderBy(x => x.Replace('\\', '/'), StringComparer.Ordinal))  // same order on Windows
+            {
+                string dir = Path.GetDirectoryName(manifest);
+                string group = Path.GetRelativePath(root, dir);
+                foreach (string line in File.ReadLines(manifest).Skip(1))
+                {
+                    string[] f = line.Split('\t');
+                    string hash = f[10];
+                    if (jobs.TryGetValue(hash, out Job j)) jobs[hash] = j with { Stages = j.Stages + 1 };
+                    else jobs[hash] = new Job(hash, group, Path.Combine(dir, f[11]), Path.Combine(dir, f[12]), 1, GlslcByHash.GetValueOrDefault(hash));
+                }
+            }
+            return jobs.Values.ToList();
+        }
+
+        // A block of a unique.tsv row (Blobs): its pack slice when the row has the ref column, else <root>/<kind>/<name>.bin.
+        static string CorpusBlob(string root, Dictionary<string, string> row, string refColumn, string kind, string name)
+        {
+            if (row.TryGetValue(refColumn, out string r) && r != "")
+            {
+                string[] p = r.Split(':');
+                return $"{Path.Combine(root, "pack", p[0] + "." + kind)}|{p[1]}|{p[2]}";
+            }
+            return Path.Combine(root, kind, name + ".bin");
+        }
+
+        static IEnumerable<Dictionary<string, string>> ReadTsv(string path)
+        {
+            string[] header = null;
+            foreach (string line in File.ReadLines(path))
+            {
+                string[] f = line.Split('\t');
+                if (header == null) { header = f; continue; }
+                Dictionary<string, string> row = new();
+                for (int k = 0; k < header.Length && k < f.Length; k++) row[header[k]] = f[k];
+                yield return row;
+            }
+        }
+
+        static int Batch(string[] args)
+        {
+            // --reflect <Ampere corpus>: find each block's GLSLC output (reflection section) by code hash.
+            string reflect = Opt(args, "--reflect", null);
+            if (reflect != null)
+                foreach (var row in ReadTsv(Path.Combine(reflect, "unique.tsv")))
+                    GlslcByHash[row["code_sha1_16"]] = CorpusBlob(reflect, row, "glslc_ref", "glslc", row["first_glslc"]);
+            string root = args[1];
+            string outDir = Opt(args, "--out", null) ?? throw new ArgumentException("--out is required");
+            int jobsN = int.Parse(Opt(args, "--jobs", "2"));
+            int limit = int.Parse(Opt(args, "--limit", "0"));
+            string targetEnv = Opt(args, "--target-env", "vulkan1.3");
+            bool validate = !args.Contains("--no-val");
+            string spirvVal = Opt(args, "--spirv-val", FindSpirvVal());
+            Directory.CreateDirectory(outDir);
+
+            List<Job> jobs = LoadJobs(root);
+            if (limit > 0) jobs = jobs.Take(limit).ToList();
+            Console.WriteLine($"{jobs.Count} distinct code blocks, {jobsN} jobs, validation {(validate ? targetEnv : "off")}");
+            Progress($"{jobs.Count} blocks loaded, {jobsN} jobs");
+
+            ConcurrentBag<Result> results = new();
+            // Rows go out as each block finishes, after its .spv is on disk: a run that is stopped (the player pauses Set up, the
+            // machine sleeps, the process dies) keeps every block it had translated and the caller can commit them. It also means
+            // a corpus no longer has to be translated in small chunks to stay safe, which is what cost most of the wall clock:
+            // each chunk paid a fresh process, a cold JIT and a thread pool ramp.
+            using ResultWriter writer = new(Path.Combine(outDir, "results.tsv"));
+            int done = 0;
+            Stopwatch total = Stopwatch.StartNew();
+            // Every block occupies two thread pool threads: the Parallel.ForEach body, which waits for the result, and the task that
+            // translates. The pool starts with one thread per CPU, so the translator's threads arrived by injection (about one a
+            // second) and a short run spent its whole life short of workers. Ask for them up front.
+            ThreadPool.GetMinThreads(out int minWorker, out int minIo);
+            ThreadPool.SetMinThreads(Math.Max(minWorker, jobsN * 2), Math.Max(minIo, jobsN));
+            Parallel.ForEach(jobs, new ParallelOptions { MaxDegreeOfParallelism = jobsN }, job =>
+            {
+                Result r;
+                byte[] spv = null;
+                // A translator bug could loop forever; run on a task so a stuck block is reported, not waited on.
+                Task<(Result, byte[])> t = Task.Run(() =>
+                {
+                    try
+                    {
+                        Result x = Translate(Blobs.Read(job.CodePath), Blobs.Read(job.CtrlPath), out byte[] s, false, job.GlslcPath);
+                        return (x, s);
+                    }
+                    catch (Exception e)
+                    {
+                        // One unreadable or broken block must not end a 99,000-block run: its row says so and the run goes on.
+                        return (new Result { Status = "error", Error = $"{e.GetType().Name}: {e.Message} [{job.CodePath} / {job.CtrlPath}]" }, null);
+                    }
+                });
+                try
+                {
+                    if (t.Wait(Timeout)) (r, spv) = t.Result;
+                    else r = new Result { Status = "timeout", Error = $"no result after {Timeout.TotalSeconds} s" };
+                }
+                catch (AggregateException e)
+                {
+                    r = new Result { Status = "error", Error = e.InnerException?.Message ?? e.Message };
+                }
+                r.Hash = job.Hash;
+                r.Group = job.Group;
+                r.Stages = job.Stages;
+                if (spv != null)
+                {
+                    string spvPath = Path.Combine(outDir, job.Hash + ".spv");
+                    File.WriteAllBytes(spvPath, spv);
+                    if (validate)
+                    {
+                        r.ValError = RunSpirvVal(spirvVal, targetEnv, spvPath);
+                        if (r.ValError != "") r.Status = "invalid";
+                    }
+                }
+                writer.Add(r);   // after the .spv: a row is what makes a block count as done
+                results.Add(r);
+                int n = Interlocked.Increment(ref done);
+                if (n == 1) Progress($"first block done ({r.Status})");
+                if (n % 500 == 0)
+                {
+                    Console.WriteLine($"  {n}/{jobs.Count}  {total.Elapsed.TotalSeconds:F0} s");
+                    Progress($"{n}/{jobs.Count}");
+                }
+            });
+
+            List<Result> all = results.OrderBy(r => r.Group).ThenBy(r => r.Hash).ToList();
+            string summary = Summarize(all, total.Elapsed, targetEnv);
+            File.WriteAllText(Path.Combine(outDir, "summary.txt"), summary);
+            Console.Write(summary);
+            Progress($"done: {all.Count} blocks");
+            return 0;
+        }
+
+        /// --serve: one process for a whole Set up. Each line on stdin names a corpus folder (the launcher writes one per chunk) and
+        /// gets the same translation a one-shot --batch run does; when that chunk's results.tsv and summary.txt are written, "chunk
+        /// done" goes to stdout and the process waits for the next line. Nothing carries over between chunks but the process, which
+        /// is the point: a chunk no longer pays the .NET start, the cold JIT and the thread pool ramp.
+        static int Serve(string[] args)
+        {
+            string outDir = Opt(args, "--out", null) ?? throw new ArgumentException("--out is required");
+            Directory.CreateDirectory(outDir);
+            List<string> common = args.Skip(1).Where(a => a != "--serve").ToList();   // what a --batch run gets, less its corpus folder
+            // The launcher writes each folder as UTF-8. Console.In decodes a redirected stdin with the console code page on Windows,
+            // so a game folder with a non-ASCII character (a user name such as "José") reached Batch mangled and LoadJobs failed
+            // in Directory.EnumerateFiles on a folder that does not exist.
+            using StreamReader input = new(Console.OpenStandardInput(), new UTF8Encoding(false));
+            string line;
+            while ((line = input.ReadLine()) != null)
+            {
+                line = line.Trim();
+                if (line.Length == 0) continue;
+                if (line == "quit") break;
+                List<string> chunk = new() { "--batch", line };
+                chunk.AddRange(common);
+                try
+                {
+                    Batch(chunk.ToArray());
+                }
+                catch (Exception e)
+                {
+                    // a chunk that dies ends the worker: the launcher reads ErrorFile and starts another one
+                    Fail(outDir, e.ToString());
+                    Console.WriteLine("chunk failed");
+                    return 3;
+                }
+                Console.WriteLine("chunk done");
+            }
+            return 0;
+        }
+
+        // spirv-val prints "error: line N: <message>" then the offending instruction; keep the first line.
+        static string RunSpirvVal(string tool, string targetEnv, string path)
+        {
+            ProcessStartInfo psi = new(tool, ["--target-env", targetEnv, path])
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+            using Process p = Process.Start(psi);
+            string err = p.StandardError.ReadToEnd() + p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+            if (p.ExitCode == 0) return "";
+            string first = err.Split('\n').FirstOrDefault(l => l.StartsWith("error")) ?? err.Split('\n')[0];
+            return first.Trim();
+        }
+
+        // results.tsv, a row appended as each block finishes (see Batch). One writer, one lock: a row is a few hundred bytes and
+        // handing it to the OS at once is what keeps it after a killed process.
+        sealed class ResultWriter : IDisposable
+        {
+            const string Header = "hash\tgroup\tstage\tstages_using\tstatus\tms\tspv_bytes\tresources\ttranslator_messages\terror\tdraw_time_queries\tglslc_reflection";
+
+            readonly StreamWriter _w;
+            readonly object _lock = new();
+
+            public ResultWriter(string path)
+            {
+                _w = new StreamWriter(path) { NewLine = "\n", AutoFlush = true };   // LF on Windows too: same bytes as on macOS
+                _w.WriteLine(Header);
+            }
+
+            public void Add(Result r)
+            {
+                string err = (r.Error + " " + r.ValError).Trim().Replace('\t', ' ').Replace('\n', ' ');
+                string line = $"{r.Hash}\t{r.Group}\t{r.Stage}\t{r.Stages}\t{r.Status}\t{r.Ms:F1}\t{r.SpvBytes}\t{r.Resources}\t" +
+                              $"{string.Join(" | ", r.Messages).Replace('\t', ' ')}\t{err}\t{r.Queries}\t{r.Reflection}";
+                lock (_lock) _w.WriteLine(line);
+            }
+
+            public void Dispose() => _w.Dispose();
+        }
+
+        // Group messages that differ only in numbers ("Attribute offset 0x3A0 ..." etc.) so the summary stays short.
+        static string Normalize(string s) => Regex.Replace(Regex.Replace(s, @"0x[0-9A-Fa-f]+", "0x#"), @"\b\d+\b", "#");
+
+        static string Summarize(List<Result> all, TimeSpan elapsed, string targetEnv)
+        {
+            StringBuilder sb = new();
+            int stagesTotal = all.Sum(r => r.Stages);
+            sb.AppendLine($"blocks {all.Count} (stages using them: {stagesTotal}), {elapsed.TotalSeconds:F0} s, spirv-val --target-env {targetEnv}");
+            sb.AppendLine();
+            sb.AppendLine("status        blocks   stages   (per stage kind)");
+            foreach (var g in all.GroupBy(r => r.Status).OrderByDescending(g => g.Count()))
+            {
+                string kinds = string.Join(", ", g.GroupBy(r => r.Stage).OrderBy(k => k.Key).Select(k => $"{k.Key} {k.Count()}"));
+                sb.AppendLine($"{g.Key,-12} {g.Count(),7} {g.Sum(r => r.Stages),8}   ({kinds})");
+            }
+            sb.AppendLine();
+            sb.AppendLine("per group (blocks: ok / ok-retry / invalid / exception / timeout)");
+            foreach (var g in all.GroupBy(r => Regex.Replace(r.Group, @"^(effect|layout)_.*", "$1_*")).OrderBy(g => g.Key))
+            {
+                sb.AppendLine($"  {g.Key,-24} {g.Count(),6}: {g.Count(r => r.Status == "ok")} / {g.Count(r => r.Status == "ok-retry")} / {g.Count(r => r.Status == "invalid")} / " +
+                              $"{g.Count(r => r.Status == "exception")} / {g.Count(r => r.Status == "timeout")}");
+            }
+            void Top(string title, IEnumerable<string> items, int n = 25)
+            {
+                var groups = items.GroupBy(Normalize).OrderByDescending(g => g.Count()).ToList();
+                if (groups.Count == 0) return;
+                sb.AppendLine();
+                sb.AppendLine(title);
+                foreach (var g in groups.Take(n)) sb.AppendLine($"  {g.Count(),6}  {g.First()}");
+                if (groups.Count > n) sb.AppendLine($"  ... {groups.Count - n} more kinds");
+            }
+            Top("exceptions (by message)", all.Where(r => r.Status is "exception" or "timeout").Select(r => r.Error));
+            // Ampere front end: blocks per unhandled instruction form, and per mnemonic (a block counts once per entry).
+            Top("unsupported instruction forms (blocks)", all.SelectMany(r => r.Unsupported), 40);
+            Top("unsupported mnemonics (blocks)", all.SelectMany(r => r.Unsupported.Select(u => u.Split(':', '.')[0]).Distinct()), 40);
+            Top("spirv-val errors (first error, by message)", all.Where(r => r.ValError != "").Select(r => r.ValError));
+            Top("translator messages (blocks reporting them)", all.SelectMany(r => r.Messages));
+            Top("draw-time queries (blocks making them)", all.SelectMany(r => r.Queries.Split(',', StringSplitOptions.RemoveEmptyEntries)));
+            Top("resource kinds (blocks using them)", all.SelectMany(r => r.Resources.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => Regex.Replace(x, @"=s\d+b\d+$", "")).Distinct()), 60);
+            return sb.ToString();
+        }
+    }
+}

@@ -1,0 +1,16 @@
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+
+if(DEFINED ENV{CLANG64_PREFIX})
+    file(TO_CMAKE_PATH "$ENV{CLANG64_PREFIX}" PKP_CLANG64_ROOT)
+else()
+    set(PKP_CLANG64_ROOT "C:/msys64/clang64")
+endif()
+
+set(CMAKE_C_COMPILER "${PKP_CLANG64_ROOT}/bin/clang.exe")
+set(CMAKE_CXX_COMPILER "${PKP_CLANG64_ROOT}/bin/clang++.exe")
+set(CMAKE_C_COMPILER_TARGET "x86_64-w64-windows-gnu")
+set(CMAKE_CXX_COMPILER_TARGET "x86_64-w64-windows-gnu")
+set(CMAKE_AR "${PKP_CLANG64_ROOT}/bin/llvm-ar.exe")
+set(CMAKE_RANLIB "${PKP_CLANG64_ROOT}/bin/llvm-ranlib.exe")
+set(CMAKE_RC_COMPILER "${PKP_CLANG64_ROOT}/bin/llvm-windres.exe")

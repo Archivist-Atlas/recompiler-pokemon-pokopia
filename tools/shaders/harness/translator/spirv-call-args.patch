@@ -1,0 +1,57 @@
+Ryujinx shader translator: AstOptimizer propagated the temporaries StructuredProgram makes for SPIR-V call arguments
+back into the Call, so GenerateCall got an expression or an undeclared operand instead of a local (InvalidCastException /
+KeyNotFoundException in GetLocalPointer: the TexelFetchScale calls of texel fetches). Uses inside a Call are no longer
+replaced; the temporary and its assignment stay. Was worked around by the harness's DebugMode retry ("ok-retry"), which
+also turns off the global-to-storage-buffer pass. The Ryujinx code in the context lines is MIT.
+Second change: an assignment whose result is never read was deleted together with its operation, so atomics with
+an unused result (RED, ATOMS.POPC.INC to RZ) vanished from optimised output (only DebugMode kept them); assignments
+from atomics and calls now stay.
+Third change: because those assignments stay, an atomic or a call whose result is read once must not also be moved
+into that use (Uses.Count == 1 propagation), or it runs twice: every ATOMG counter whose result is read added its
+count twice, and the SHFL.IDX helper call that hands the result out ran twice. They are no longer propagated.
+--- a/StructuredIr/AstOptimizer.cs
++++ b/StructuredIr/AstOptimizer.cs
+@@ -24,12 +24,15 @@
+                     {
+                         bool isWorthPropagating = propVar.Uses.Count == 1 || IsWorthPropagating(assignment.Source);
+ 
+-                        if (propVar.Defs.Count == 1 && isWorthPropagating)
++                        // an atomic or a call is not moved into its use: its assignment stays (below), so moving it would run it twice
++                        // (every counter's ATOMG added twice, every shuffle call made twice)
++                        if (propVar.Defs.Count == 1 && isWorthPropagating && !HasSideEffects(assignment.Source))
+                         {
+                             PropagateExpression(propVar, assignment.Source);
+                         }
+ 
+-                        if (propVar.Type == OperandType.LocalVariable && propVar.Uses.Count == 0)
++                        // an unused result does not make the operation dead: an atomic (RED, ATOMS with RZ) or a call must stay
++                        if (propVar.Type == OperandType.LocalVariable && propVar.Uses.Count == 0 && !HasSideEffects(assignment.Source))
+                         {
+                             visitor.Block.Remove(assignment);
+ 
+@@ -42,6 +45,11 @@
+             RemoveEmptyBlocks(mainBlock);
+         }
+ 
++        private static bool HasSideEffects(IAstNode source)
++        {
++            return source is AstOperation op && (op.Inst.IsAtomic() || op.Inst == Instruction.Call);
++        }
++
+         private static bool IsWorthPropagating(IAstNode source)
+         {
+             if (source is not AstOperation srcOp)
+@@ -69,6 +77,13 @@
+                 }
+                 else if (useNode is AstOperation useOperation)
+                 {
++                    // SPIR-V call arguments must stay the temporary locals StructuredProgram made for them (GenerateCall takes
++                    // their pointers); folding the value in throws in GenerateCall.
++                    if (useOperation.Inst == Instruction.Call)
++                    {
++                        continue;
++                    }
++
+                     for (int srcIndex = 0; srcIndex < useOperation.SourcesCount; srcIndex++)
+                     {
+                         if (useOperation.GetSource(srcIndex) == propVar)
