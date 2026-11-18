@@ -262,6 +262,42 @@ while queue:
     if ($LASTEXITCODE -ne 0) { Say "failed to copy runtime DLLs"; exit 1 }
 }
 
+# ---- 3b. Extract & translate NVN2 shaders to shader_cache/spirv ----
+$spirvDir = Join-Path $Dir "shader_cache\spirv"
+$spirvResults = Join-Path $spirvDir "results.tsv"
+if (-not (Test-Path -LiteralPath $spirvResults)) {
+    $harnessCache = Join-Path $env:LOCALAPPDATA "Switch2Recomp\_cache\pokopia_spirv_harness"
+    $harnessExe = Join-Path $harnessCache "spirv_harness.exe"
+    if (-not (Test-Path -LiteralPath $harnessExe)) {
+        Say "downloading spirv_harness (PokopiaRecomp v0.15.0)..."
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        New-Item -ItemType Directory -Force -Path $harnessCache | Out-Null
+        $tmpZip = Join-Path $env:TEMP "PokopiaRecomp-0.15.0-win64.zip"
+        Invoke-WebRequest -Uri "https://github.com/Dittobyte/Recompia/releases/download/v0.15.0/PokopiaRecomp-0.15.0-win64.zip" -OutFile $tmpZip -UseBasicParsing
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($tmpZip)
+        foreach ($entry in $zip.Entries) {
+            if ($entry.FullName -match '/tools/spirv_harness/(.+)$' -and $entry.Name) {
+                $dst = Join-Path $harnessCache $Matches[1]
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dst, $true)
+            }
+        }
+        $zip.Dispose()
+        Remove-Item -LiteralPath $tmpZip -Force -ErrorAction SilentlyContinue
+    }
+    $corpusDir = Join-Path $Dir "shader_cache\corpus"
+    $extractPy = Join-Path $source "tools\shaders\ampere\extract_corpus.py"
+    $shaderJobs = [Math]::Max(1, [Math]::Min($cpuCount, 12))
+    Say "extracting NVN2 shader corpus..."
+    & $pyExe -I $extractPy --romfs (Join-Path $Dir "romfs") --main (Join-Path $Dir "exefs\main") --out $corpusDir --jobs $shaderJobs
+    if ($LASTEXITCODE -ne 0) { Say "shader corpus extraction failed"; exit 1 }
+    Say "translating shaders to SPIR-V..."
+    New-Item -ItemType Directory -Force -Path $spirvDir | Out-Null
+    & $harnessExe --batch $corpusDir --out $spirvDir --jobs $shaderJobs --no-val
+    if ($LASTEXITCODE -ne 0) { Say "spirv_harness failed"; exit 1 }
+    Remove-Item -Recurse -Force -LiteralPath $corpusDir -ErrorAction SilentlyContinue
+}
+
 # ---- 4. Pre-launch UI, config, shortcuts & Windows uninstaller ----
 $repoRoot = Resolve-Path (Join-Path $source "..\..\..")
 $isLauncherExe = $false

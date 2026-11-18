@@ -18,7 +18,9 @@
 #include "nxrt/input.h"
 #include "nxrt/log.h"
 
-#if defined(__APPLE__)
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <unistd.h>
 #endif
@@ -470,6 +472,19 @@ bool create_window(const WindowDesc& desc) {
         NXLOG_E(kTag, "SDL_CreateWindow failed: %s", SDL_GetError());
         return false;
     }
+#if defined(_WIN32)
+    if (HWND hwnd = static_cast<HWND>(native_hwnd())) {
+        HINSTANCE hinst = GetModuleHandleW(nullptr);
+        if (HICON big_icon = static_cast<HICON>(LoadImageW(hinst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                                            GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR))) {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big_icon));
+        }
+        if (HICON small_icon = static_cast<HICON>(LoadImageW(hinst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                                              GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR))) {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
+        }
+    }
+#endif
     int pw = 0, ph = 0;
     current_pixel_size(&pw, &ph);
     NXLOG_I(kTag, "window %dx%d, pixels %dx%d, density %.2f%s", desc.width, desc.height, pw, ph,

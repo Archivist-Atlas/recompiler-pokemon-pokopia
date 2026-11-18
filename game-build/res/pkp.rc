@@ -13,6 +13,7 @@
 #define PKP_VER_TEXT "dev"
 #endif
 
+1 ICON "pkp.ico"
 1 24 "pkp.manifest"
 
 1 VERSIONINFO

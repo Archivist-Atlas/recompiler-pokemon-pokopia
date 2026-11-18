@@ -186,7 +186,7 @@ if(WIN32)
         "#define PKP_VER_MINOR ${PKP_VER_MINOR}\n"
         "#define PKP_VER_PATCH ${PKP_VER_PATCH}\n"
         "#define PKP_VER_TEXT \"${PKP_VERSION}\"\n")
-    set_source_files_properties(res/pkp.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/pkp.manifest;${PKP_GEN_INCLUDE}/pkp_ver.h")
+    set_source_files_properties(res/pkp.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/pkp.manifest;${CMAKE_CURRENT_SOURCE_DIR}/res/pkp.ico;${PKP_GEN_INCLUDE}/pkp_ver.h")
 endif()
 target_compile_definitions(pkp PRIVATE PKP_EXEFS_DEFAULT="${PKP_EXEFS_DEFAULT}")
 target_include_directories(pkp PRIVATE "${PKP_GEN_INCLUDE}")
