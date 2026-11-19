@@ -111,8 +111,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $exefsDir "main")) -or -not (Test-Pa
         Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
     }
 
-    $foundExefs = Get-ChildItem -Path $extractTmp -Recurse -Directory -Filter "exefs" | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "main") } | Select-Object -Last 1
-    $foundRomfs = Get-ChildItem -Path $extractTmp -Recurse -Directory -Filter "romfs" | Select-Object -Last 1
+    $foundExefs = Get-ChildItem -LiteralPath $extractTmp -Recurse -Directory -Filter "exefs" | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "main") } | Select-Object -Last 1
+    $foundRomfs = Get-ChildItem -LiteralPath $extractTmp -Recurse -Directory -Filter "romfs" | Select-Object -Last 1
     if (-not $foundExefs -or -not $foundRomfs) {
         Say "error: exefs or romfs not found after extracting .nup"
         exit 1
