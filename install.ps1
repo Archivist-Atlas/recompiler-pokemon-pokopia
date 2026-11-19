@@ -392,7 +392,8 @@ $tplPath = Join-Path $source "launch_options_template.json"
 if (Test-Path -LiteralPath $tplPath) {
     $tpl = Get-Content -LiteralPath $tplPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $tpl.working_dir = $Dir
-    $tpl.command = @($pkpExe, "--game", $Dir, "--exefs", (Join-Path $Dir "exefs"), "--window")
+    $tpl | Add-Member -NotePropertyName "rom_path" -NotePropertyValue $Nup -Force
+    $tpl.command = @($pkpExe, "--game", $Dir, "--exefs", "{rom}", "--window")
     $jsonOut = $tpl | ConvertTo-Json -Depth 10
     [System.IO.File]::WriteAllText($launchConfigPath, $jsonOut, $utf8NoBom)
 }

@@ -3,6 +3,7 @@
   "version": "Switch 2 Edition (PC Recomp)",
   "icon": "game_icon.ico",
   "icon_png": "game_icon.png",
+  "rom_env_var": "PKP_RECOMP_NUP",
   "options": [
     {
       "id": "fullscreen",
