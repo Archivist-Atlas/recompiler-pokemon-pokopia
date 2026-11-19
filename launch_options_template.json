@@ -48,5 +48,9 @@
     "--exefs",
     "{{INSTALL_DIR}}/exefs",
     "--window"
+  ],
+  "expected_title_ids": [
+    "0400A3A01EE4C000",
+    "0400A3A01EE4C800"
   ]
 }
