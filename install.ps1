@@ -298,6 +298,76 @@ if (-not (Test-Path -LiteralPath $spirvResults)) {
     Remove-Item -Recurse -Force -LiteralPath $corpusDir -ErrorAction SilentlyContinue
 }
 
+# Compact loose .spv files into shader_cache/spirv.archive/000000.pack (NXSPACK1 + zstd) to save ~15+ GB on NTFS
+$archiveDir = Join-Path $Dir "shader_cache\spirv.archive"
+$archivePack = Join-Path $archiveDir "000000.pack"
+if ((Test-Path -LiteralPath $spirvResults) -and (-not (Test-Path -LiteralPath $archivePack))) {
+    $packPy = Join-Path $workRoot "pack_shaders.py"
+    $packCode = @'
+import ctypes, glob, os, struct, sys
+
+spirv_dir, out_pack, zstd_dll = sys.argv[1], sys.argv[2], sys.argv[3]
+spv_files = sorted(glob.glob(os.path.join(spirv_dir, "*.spv")))
+if not spv_files:
+    sys.exit(0)
+
+lib = ctypes.CDLL(zstd_dll)
+lib.ZSTD_compressBound.argtypes = [ctypes.c_size_t]
+lib.ZSTD_compressBound.restype = ctypes.c_size_t
+lib.ZSTD_compress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+lib.ZSTD_compress.restype = ctypes.c_size_t
+lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
+lib.ZSTD_isError.restype = ctypes.c_uint
+
+os.makedirs(os.path.dirname(out_pack), exist_ok=True)
+tmp_pack = out_pack + ".tmp"
+entries = []
+with open(tmp_pack, "wb") as f:
+    f.write(b"\x00" * 32)  # PackHeader placeholder
+    offset = 32
+    for path in spv_files:
+        name = os.path.splitext(os.path.basename(path))[0]
+        if len(name) != 16:
+            continue
+        raw = open(path, "rb").read()
+        usize = len(raw)
+        if usize == 0 or (usize % 4) != 0:
+            continue
+        bound = lib.ZSTD_compressBound(usize)
+        dst = ctypes.create_string_buffer(bound)
+        csize = lib.ZSTD_compress(dst, bound, raw, usize, 6)
+        if lib.ZSTD_isError(csize):
+            raise RuntimeError(f"ZSTD_compress failed on {name}")
+        f.write(dst.raw[:csize])
+        entries.append((name.encode("ascii"), 0, offset, csize, usize))
+        offset += csize
+    index_offset = offset
+    for h16, line_hash, off, csize, usize in entries:
+        f.write(struct.pack("<16sQQII", h16, line_hash, off, csize, usize))
+    f.seek(0)
+    f.write(struct.pack("<8sIIQQ", b"NXSPACK1", 1, len(entries), index_offset, 0))
+
+os.replace(tmp_pack, out_pack)
+for path in spv_files:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+print(f"packed {len(entries)} shaders -> {out_pack} ({index_offset // (1024*1024)} MiB)")
+'@
+    [System.IO.File]::WriteAllText($packPy, $packCode, $utf8NoBom)
+    $zstdDll = Join-Path $clang64Bin "libzstd.dll"
+    Say "compacting shader cache into spirv.archive..."
+    & $pyExe $packPy $spirvDir $archivePack $zstdDll
+    if ($LASTEXITCODE -ne 0) { Say "warning: shader archive compaction failed (loose .spv files kept)" }
+}
+
+$pkpIniPath = Join-Path $Dir "pkp.ini"
+if (-not (Test-Path -LiteralPath $pkpIniPath)) {
+    $iniText = "[nvn]`nshader_cache = shader_cache/spirv`ndump_missing = shader_cache/missing`n"
+    [System.IO.File]::WriteAllText($pkpIniPath, $iniText, $utf8NoBom)
+}
+
 # ---- 4. Pre-launch UI, config, shortcuts & Windows uninstaller ----
 $repoRoot = Resolve-Path (Join-Path $source "..\..\..")
 $isLauncherExe = $false
@@ -341,12 +411,26 @@ if (Test-Path -LiteralPath $pngSrc) {
 }
 
 $runner = Join-Path $Dir "pkp.cmd"
+$postTranslate = @'
+if exist "%~dp0shader_cache\missing\manifest.tsv" (
+    if exist "%LOCALAPPDATA%\Switch2Recomp\_cache\pokopia_spirv_harness\spirv_harness.exe" (
+        "%LOCALAPPDATA%\Switch2Recomp\_cache\pokopia_spirv_harness\spirv_harness.exe" --batch "%~dp0shader_cache\missing" --out "%~dp0shader_cache\missing_out" --no-val >nul 2>nul
+        if exist "%~dp0shader_cache\missing_out\results.tsv" (
+            for %%F in ("%~dp0shader_cache\missing_out\*.spv") do move /Y "%%F" "%~dp0shader_cache\spirv\" >nul 2>nul
+            more +1 "%~dp0shader_cache\missing_out\results.tsv" >> "%~dp0shader_cache\spirv\results.tsv"
+        )
+        rmdir /s /q "%~dp0shader_cache\missing" 2>nul
+        rmdir /s /q "%~dp0shader_cache\missing_out" 2>nul
+    )
+)
+'@
 if ($isLauncherExe -and (Test-Path -LiteralPath $launcherUiDst) -and (Test-Path -LiteralPath $launchConfigPath)) {
     $cmdText = @"
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
 "%~dp0game_launcher.exe" --config "%~dp0launch_options.json" %*
+$postTranslate
 "@
 } else {
     $cmdText = @"
