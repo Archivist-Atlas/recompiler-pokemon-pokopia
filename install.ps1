@@ -100,28 +100,41 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $exefsDir = Join-Path $Dir "exefs"
 $romfsDir = Join-Path $Dir "romfs"
 if (-not (Test-Path -LiteralPath (Join-Path $exefsDir "main")) -or -not (Test-Path -LiteralPath $romfsDir)) {
-    Say "extracting ExeFS and RomFS from .nup..."
-    $extractTmp = Join-Path $workRoot "extracted"
-    if (Test-Path -LiteralPath $extractTmp) { Remove-Item -Recurse -Force $extractTmp }
-    $env:PYTHONPATH = (Join-Path $source "tools")
-    try {
-        & $pyExe -m nup.cli extract $Nup $extractTmp
-        if ($LASTEXITCODE -ne 0) { Say "nup extract failed"; exit 1 }
-    } finally {
-        Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
-    }
+    if (Test-Path -LiteralPath $Nup -PathType Container) {
+        $srcExefs = if (Test-Path -LiteralPath (Join-Path $Nup "exefs\main")) { Join-Path $Nup "exefs" } else { $Nup }
+        $srcRomfs = Join-Path $Nup "romfs"
+        if (-not (Test-Path -LiteralPath (Join-Path $srcExefs "main")) -or -not (Test-Path -LiteralPath $srcRomfs)) {
+            Say "error: folder must contain exefs/main and romfs/: $Nup"; exit 1
+        }
+        Say "copying ExeFS and RomFS from folder..."
+        if (Test-Path -LiteralPath $exefsDir) { Remove-Item -Recurse -Force $exefsDir }
+        if (Test-Path -LiteralPath $romfsDir) { Remove-Item -Recurse -Force $romfsDir }
+        Copy-Item -LiteralPath $srcExefs -Destination $exefsDir -Recurse -Force
+        Copy-Item -LiteralPath $srcRomfs -Destination $romfsDir -Recurse -Force
+    } else {
+        Say "extracting ExeFS and RomFS from .nup..."
+        $extractTmp = Join-Path $workRoot "extracted"
+        if (Test-Path -LiteralPath $extractTmp) { Remove-Item -Recurse -Force $extractTmp }
+        $env:PYTHONPATH = (Join-Path $source "tools")
+        try {
+            & $pyExe -m nup.cli extract $Nup $extractTmp
+            if ($LASTEXITCODE -ne 0) { Say "nup extract failed"; exit 1 }
+        } finally {
+            Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+        }
 
-    $foundExefs = Get-ChildItem -LiteralPath $extractTmp -Recurse -Directory -Filter "exefs" | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "main") } | Select-Object -Last 1
-    $foundRomfs = Get-ChildItem -LiteralPath $extractTmp -Recurse -Directory -Filter "romfs" | Select-Object -Last 1
-    if (-not $foundExefs -or -not $foundRomfs) {
-        Say "error: exefs or romfs not found after extracting .nup"
-        exit 1
+        $foundExefs = Get-ChildItem -LiteralPath $extractTmp -Recurse -Directory -Filter "exefs" | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "main") } | Select-Object -Last 1
+        $foundRomfs = Get-ChildItem -LiteralPath $extractTmp -Recurse -Directory -Filter "romfs" | Select-Object -Last 1
+        if (-not $foundExefs -or -not $foundRomfs) {
+            Say "error: exefs or romfs not found after extracting .nup"
+            exit 1
+        }
+        if (Test-Path -LiteralPath $exefsDir) { Remove-Item -Recurse -Force $exefsDir }
+        if (Test-Path -LiteralPath $romfsDir) { Remove-Item -Recurse -Force $romfsDir }
+        Move-Item -LiteralPath $foundExefs.FullName -Destination $exefsDir
+        Move-Item -LiteralPath $foundRomfs.FullName -Destination $romfsDir
+        Remove-Item -Recurse -Force $extractTmp -ErrorAction SilentlyContinue
     }
-    if (Test-Path -LiteralPath $exefsDir) { Remove-Item -Recurse -Force $exefsDir }
-    if (Test-Path -LiteralPath $romfsDir) { Remove-Item -Recurse -Force $romfsDir }
-    Move-Item -LiteralPath $foundExefs.FullName -Destination $exefsDir
-    Move-Item -LiteralPath $foundRomfs.FullName -Destination $romfsDir
-    Remove-Item -Recurse -Force $extractTmp -ErrorAction SilentlyContinue
 }
 
 # ---- 2. Lift NSOs & build static game module libraries ----
