@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Pokémon Pokopia: the check a module makes of its hook sites once main is loaded, before it arms its hooks: every site holds the
+// Game layer: the check a module makes of its hook sites once main is loaded, before it arms its hooks: every site holds the
 // instruction word the module was written against, and a midhook's site is a hook site of the lifted game libraries (the lifter makes
 // it a function of its own; an entry hook's address is a lifted function either way).
 #pragma once
@@ -11,6 +11,8 @@
 #include "nxrt/memory.h"
 
 namespace nxrt::games::pkp {
+
+constexpr uint32_t kPacibsp = 0xd503237fu;   // pacibsp: the first instruction of most of the game's functions
 
 struct HookSite {
     uint64_t site;   // offset in main
@@ -28,5 +30,10 @@ inline const HookSite* first_bad_site(uint64_t base, const HookSite* sites, size
     }
     return nullptr;
 }
+
+// For a site first_bad_site returned (word: what it found there): true when main holds the expected word but the lifted libraries have
+// no hook site at it (the game is the right one; pkp.exe was linked before the site was added: Set up again relinks it). False: main
+// holds another word (another game version or dump).
+inline bool site_missing_from_lift(const HookSite& site, uint32_t word) { return !site.entry && word == site.word; }
 
 }  // namespace nxrt::games::pkp

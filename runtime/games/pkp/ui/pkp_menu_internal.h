@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Pokémon Pokopia, the mouse in the game's menus (pkp_menu.cpp and the files it is split into): the scan's state, the game's layout and pane
+// Game layer, the mouse in the game's menus (pkp_menu.cpp and the files it is split into): the scan's state, the game's layout and pane
 // offsets, and the functions one of those files calls in another. Internal to those files.
 #pragma once
 #include <atomic>
@@ -35,7 +35,9 @@ constexpr size_t kEntInstances = 32, kEntFree = 40;
 constexpr uint64_t kMaxPoolEntries = 512, kMaxInstances = 64;
 constexpr size_t kPlaceableObj = 40, kObjLayout = 16;     // placeable +40 -> object, +16 -> the layout (DoPaneHitTest 0x2611d00)
 // layout
-constexpr size_t kLayPaneCount = 146, kLayFirstNode = 32, kLaySentinel = 64;   // u16 pane count; pane list: node +8 next, +16 pane
+using layout::kLayFirstNode;
+using layout::kLayPaneCount;
+using layout::kLaySentinel;
 // pane
 using layout::kPaneName;
 using layout::kPaneNameLen;
@@ -91,8 +93,6 @@ struct State {
     // in-game menus (menu_in_game): a layout with the game's cursor on an entry while the game is in play
     bool ig_enabled = false;
     bool ig_up = false;                // the in-game menu is up (debounced)
-    std::atomic<bool> pause_up{false}; // the in-game menu is the pause menu's main view (pkp_save_now.cpp reads it)
-    char ig_focus[48] = {};            // the selected entry's pane name
     int ig_tick = 0, ig_hits = 0, ig_miss = 0;
     bool frame_scanned = false;        // menu_frame scanned this frame (the next poll reuses its result)
     bool frame_present = false;

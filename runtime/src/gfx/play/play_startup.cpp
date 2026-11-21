@@ -2,7 +2,9 @@
 // Play mode: loading the settings, start and stop, the process exit and the public API (play.h).
 #include "play_state.h"
 #include "nxrt/key_state.h"
+#include "nxrt/perf_report.h"
 #include "nxrt/screenshot.h"
+#include "nxrt/split.h"
 #include "nxrt/text.h"
 #include "nxrt/vi_sinks.h"
 
@@ -19,6 +21,7 @@ using namespace detail;
         st.dirty = false;
     }
     if (flush_gpu_cache) nvn::backend_flush_caches();   // unsafe after VK_ERROR_DEVICE_LOST; normal early-exit paths still save it
+    perf::session_end();     // TerminateProcess below: runtime::shutdown (hitch_stop) never runs on this path
     nxrt::log_flush();
     if (tt::enabled() && !tt::finished()) tt::end_run(code, verdict, message);     // writes result.json, then terminates
     TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
@@ -102,6 +105,8 @@ bool load() {
     // reads both once, at its first pool and its first submission, after this.
     if (!config_has("nvn", "pool_mirror")) config_set("nvn", "pool_mirror", st.settings.display.fast_gpu_memory ? "on" : "off");
     if (!config_has("nvn", "pass_barriers")) config_set("nvn", "pass_barriers", st.settings.display.fewer_gpu_waits ? "tracked" : "full");
+    // Uniform snapshots: the file's choice becomes [nvn] uniform_snapshot unless the ini or the environment set it (read once, at the first uniform bind).
+    if (!config_has("nvn", "uniform_snapshot")) config_set("nvn", "uniform_snapshot", st.settings.display.uniform_snapshot.c_str());
     // Prewarm: the file's choice becomes [nvn] prewarm unless the ini or the environment set it (read once, by the pipeline prewarm).
     if (!config_has("nvn", "prewarm")) config_set("nvn", "prewarm", st.settings.display.shader_prewarm ? "true" : "false");
     // ASTC texture quality: the file's choice becomes [gfx] astc_quality unless the ini or the environment set it (the texture back end reads it at its first ASTC texture).
@@ -132,6 +137,8 @@ DisplayConfig display() {
     d.fps_cap = st.settings.display.fps_cap;
     d.keep_aspect = st.settings.display.keep_aspect;
     d.present_mode = present_mode_for(st.settings.display);
+    d.places_window = split_active();
+    d.takes_focus = split::window() <= 1;
     return d;
 }
 
@@ -197,6 +204,8 @@ bool start(const StartOptions& opt) {
     if (st.renderer) screenshot::set_provider(&screenshot_provider, nullptr);
     if (st.renderer) tt::set_screenshot_flush(&gfx::wait_screenshot_writes);
     set_hdr_luminance_sink(&extras::hdr_note_layer_luminance);
+    perf_settings_register();
+    if (st.window) perf::note_focus(platform::focused());     // a window opened without focus sends no focus-lost event
     if (const std::string script = config_get_str("play", "selftest", ""); !script.empty()) {
         std::string err;
         if (!st.selftest.parse(script, &err)) {
@@ -240,8 +249,12 @@ bool start(const StartOptions& opt) {
     // game waits for it (keyboard_service; also headless with swkbd_prompt = force, which has an overlay and no window)
     if (st.window || st.overlay) svc_set_busy_hook(GetCurrentThreadId(), &busy_pump);
     kernel::set_blocked_hook(GetCurrentThreadId(), &keyboard_service);
-    if (st.window && st.settings.display.monitor > 0) platform::move_to_display(st.settings.display.monitor);
-    if (st.window && st.settings.display.window_mode != "windowed") set_window_mode(st.settings.display.window_mode);
+    if (split_active()) {
+        split_start();      // the window's part of the screen, in place of the settings' monitor and window mode
+    } else {
+        if (st.window && st.settings.display.monitor > 0) platform::move_to_display(st.settings.display.monitor);
+        if (st.window && st.settings.display.window_mode != "windowed") set_window_mode(st.settings.display.window_mode);
+    }
 
     const GamePlay* gp = game_play();
     {   // display options: the internal resolution comes from the window as it is now (after the window mode change above)

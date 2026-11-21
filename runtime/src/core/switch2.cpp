@@ -110,7 +110,7 @@ void vi_get_native_window(::Ctx* c) {
 }
 
 // nn::vi::SetLayerNext{Extended,Standard}ContentLuminanceRangeMetadata(Layer*, uint16_t min, uint16_t max): what the game declares about its
-// picture for an HDR TV (Pokopia: extended 0..400, standard 0..300 nits, from its graphics-system defaults, every time it makes the layer). The
+// picture for an HDR TV (the game: extended 0..400, standard 0..300 nits, from its graphics-system defaults, every time it makes the layer). The
 // values go to the HDR sink the graphics layer registered ([hdr] mode = native uses them; none: dropped); nn::Result 0.
 std::atomic<HdrLuminanceSink> g_hdr_sink{nullptr};
 void note_luminance(bool extended, ::Ctx* c) {
@@ -155,6 +155,8 @@ void streamplay_native_window(::Ctx* c) { c->x[0] = reinterpret_cast<uint64_t>(g
 
 void set_hdr_luminance_sink(HdrLuminanceSink fn) { g_hdr_sink.store(fn, std::memory_order_release); }
 
+namespace services::netsvc::cloud { void install_fibers(); }
+
 void install_switch2_hle() {
     if (game::info().platform != game::Platform::Switch2) return;
     struct { const char* name; HleFn fn; } const items[] = {
@@ -193,6 +195,7 @@ void install_switch2_hle() {
         module_override_symbol("_ZN2nn5movie10InitializeEv");
     }
     NXLOG_I("switch2", "Switch 2 platform: graphics system boot answered on the host");
+    services::netsvc::cloud::install_fibers();   // cloud island proof of concept ([net] cloud_server), src/services/network_cloud.cpp
 }
 
 }  // namespace nxrt

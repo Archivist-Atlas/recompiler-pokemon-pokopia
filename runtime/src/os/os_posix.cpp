@@ -114,8 +114,15 @@ Obj* as_obj(HANDLE h) {
 
 void retain(Obj* o) { o->refs.fetch_add(1, std::memory_order_relaxed); }
 
+void release_named_mutex(MutexObj* m);   // below, with the named-mutex list
+
 void release(Obj* o) {
-    if (o && o->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete o;
+    if (!o) return;
+    if (o->kind == Kind::Mutex && !static_cast<MutexObj*>(o)->name.empty()) {
+        release_named_mutex(static_cast<MutexObj*>(o));
+        return;
+    }
+    if (o->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete o;
 }
 
 DWORD self_tid() {
@@ -130,9 +137,14 @@ ThreadObj* self_thread() {
         t->tid = self_tid();
         t->started.store(true, std::memory_order_relaxed);
         t_self = t;
+#if defined(__linux__)
+        note_kernel_tid(t);
+#endif
     }
     return t_self;
 }
+
+ThreadObj* thread_if_known() { return t_self; }
 
 uint64_t filetime_of(const struct timespec& ts) {
     return 11644473600ull * 10000000ull + static_cast<uint64_t>(ts.tv_sec) * 10000000ull +
@@ -779,6 +791,9 @@ void* thread_trampoline(void* p) {
     nxos_install_altstack();   // so a fault on this thread is reportable even when its stack is exhausted
     t_tid = box.self->tid;
     t_self = box.self;
+#if defined(__linux__)
+    note_kernel_tid(box.self);
+#endif
     box.self->started.store(true, std::memory_order_release);
 
     // CREATE_SUSPENDED: the creator fills the guest Ctx before the thread may run (kernel/thread.cpp:146).
@@ -919,6 +934,14 @@ DWORD SuspendThread(HANDLE h) {
         return static_cast<DWORD>(-1);
     }
     return static_cast<DWORD>(t->suspend.fetch_add(1, std::memory_order_relaxed));
+#elif defined(__linux__)
+    // a running thread stops in the stop signal's handler (os_posix_suspend.cpp)
+    DWORD prev = 0;
+    if (!signal_suspend(t, &prev)) {
+        t_last_error = ERROR_INVALID_HANDLE;
+        return static_cast<DWORD>(-1);
+    }
+    return prev;
 #else
     t_last_error = ERROR_CALL_NOT_IMPLEMENTED;
     return static_cast<DWORD>(-1);
@@ -938,6 +961,9 @@ DWORD ResumeThread(HANDLE h) {
     }
     return 0;
 #else
+#if defined(__linux__)
+    if (DWORD stopped = 0; signal_resume(t, &stopped)) return stopped;   // stopped by SuspendThread (os_posix_suspend.cpp)
+#endif
     const int prev = t->suspend.load(std::memory_order_relaxed);
     if (prev > 0) {
         pthread_mutex_lock(&t->mu);
@@ -1065,11 +1091,35 @@ BOOL ResetEvent(HANDLE h) {
     return TRUE;
 }
 
-// Named mutexes: kernel/sched.cpp picks a scheduler slot through one and tests for ERROR_ALREADY_EXISTS.
+// Named mutexes: kernel/sched.cpp picks a scheduler slot through one and tests for ERROR_ALREADY_EXISTS; fs_volume.cpp
+// opens and closes one around every save commit. A name stays in the list while a handle to it is open: the last
+// CloseHandle takes it out under the list's lock, so a later create never finds a deleted object (it used to, and
+// retained and returned freed memory from the second save commit on). Each name in the list also holds its claim in
+// os_posix_named.cpp, which is what other processes see; it is dropped (the fd closed) under the same lock, so a create
+// right after the last close claims afresh instead of meeting this process's old lock. Waiting and owning stay inside
+// one process: a second process gets ERROR_ALREADY_EXISTS but its own mutex object.
 namespace {
 pthread_mutex_t g_named_mu = PTHREAD_MUTEX_INITIALIZER;
 std::vector<std::pair<std::string, MutexObj*>> g_named_mutexes;
 }  // namespace
+
+namespace nxos {
+
+void release_named_mutex(MutexObj* m) {
+    pthread_mutex_lock(&g_named_mu);
+    const bool last = m->refs.fetch_sub(1, std::memory_order_acq_rel) == 1;
+    if (last) {
+        for (auto it = g_named_mutexes.begin(); it != g_named_mutexes.end(); ++it)
+            if (it->second == m) {
+                g_named_mutexes.erase(it);
+                break;
+            }
+        delete m;   // under the lock: its destructor closes the claim (see above)
+    }
+    pthread_mutex_unlock(&g_named_mu);
+}
+
+}  // namespace nxos
 
 HANDLE nxos_create_mutex(const char* name, BOOL initial_owner) {
     auto* m = new MutexObj();
@@ -1085,8 +1135,16 @@ HANDLE nxos_create_mutex(const char* name, BOOL initial_owner) {
                 return kv.second;
             }
         }
+        bool others = false;
+        m->claim_fd = named_claim(m->name, &others);
         g_named_mutexes.emplace_back(m->name, m);
         pthread_mutex_unlock(&g_named_mu);
+        if (others) {   // as Win32: the mutex existed, so initial ownership is not given
+            m->signaled.store(true, std::memory_order_release);
+            t_last_error = ERROR_ALREADY_EXISTS;
+            return m;
+        }
+        t_last_error = ERROR_SUCCESS;   // as Win32: a caller testing for ERROR_ALREADY_EXISTS must not see an older error
     }
     if (initial_owner) {
         pthread_mutex_lock(&m->mu);
@@ -2003,6 +2061,13 @@ BOOL GetThreadContext(HANDLE h, LPCONTEXT ctx) {
     ctx->Cpsr = st.__cpsr;
     ctx->ContextFlags = 0x00100007u;   // CONTEXT_ARM64 | CONTROL | INTEGER | FLOATING_POINT: the whole file is there
     return TRUE;
+#elif defined(__linux__)
+    // the registers its stop signal's handler saved: the caller suspended it first (os_posix_suspend.cpp)
+    if (!signal_context(t, ctx)) {
+        t_last_error = ERROR_INVALID_HANDLE;
+        return FALSE;
+    }
+    return TRUE;
 #else
     t_last_error = ERROR_CALL_NOT_IMPLEMENTED;
     return FALSE;
@@ -2095,12 +2160,6 @@ BOOL GetLogicalProcessorInformationEx(int relationship, SYSTEM_LOGICAL_PROCESSOR
     if (cores > 64) cores = 64;   // one GROUP_AFFINITY word
 
     const DWORD entry = sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
-    const DWORD need = entry * static_cast<DWORD>(cores);
-    if (!buffer || *len < need) {
-        *len = need;
-        t_last_error = ERROR_INSUFFICIENT_BUFFER;
-        return FALSE;
-    }
     // macOS numbers the performance cores first (hw.perflevel0) and the efficiency cores after them (hw.perflevel1),
     // which is the order kernel/sched.cpp wants: a higher EfficiencyClass is a faster core.
     long performance = 0;
@@ -2109,14 +2168,50 @@ BOOL GetLogicalProcessorInformationEx(int relationship, SYSTEM_LOGICAL_PROCESSOR
     if (sysctlbyname("hw.perflevel0.logicalcpu", &performance, &perf_len, nullptr, 0) != 0) performance = 0;
     if (performance <= 0 || performance > cores) performance = cores;
 #endif
-    auto* out = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer);
+    // One entry per PHYSICAL core, its mask holding every hardware thread of that core, as the Windows API reports it:
+    // sched.cpp's cores_fastest_first() takes one thread per entry and expects the entries to be distinct cores. One entry
+    // per logical CPU made SMT siblings look like separate cores, so a 4-core/8-thread CPU offered 8 entries for 4 cores and
+    // take_core_slot() picked 6 of them: two physical cores carried two console cores each while two carried one, the case
+    // place_on_few_cores() exists for (#694). That fallback only runs when the core count is below the console's six, so the
+    // entry count being inflated kept it from ever running. A CPU with a core per entry (6 cores, 12 threads) landed on six
+    // distinct ones by numbering alone, so only the smaller CPUs were affected.
+    struct SiblingGroup { DWORD_PTR mask; long first; };
+    std::vector<SiblingGroup> groups;
+#if defined(__linux__)
     for (long i = 0; i < cores; ++i) {
+        // thread_siblings_list is "0,6" or a range such as "0-5": its first number is the group's lowest CPU, which keys the group.
+        char path[96], buf[128] = {};
+        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+        const DWORD_PTR own = static_cast<DWORD_PTR>(1) << i;
+        long lowest = i;
+        if (std::FILE* f = std::fopen(path, "rb")) {
+            if (std::fgets(buf, sizeof buf, f)) lowest = std::strtol(buf, nullptr, 10);
+            std::fclose(f);
+        }
+        if (lowest < 0 || lowest >= cores) lowest = i;   // unreadable, or a group key outside the mask: its own entry
+        bool merged = false;
+        for (SiblingGroup& g : groups)
+            if (g.first == lowest) { g.mask |= own; merged = true; break; }
+        if (!merged) groups.push_back({own, lowest});
+    }
+#endif
+    if (groups.empty())      // no topology to read (macOS, or a kernel without sysfs): every logical CPU its own entry, as before
+        for (long i = 0; i < cores; ++i) groups.push_back({static_cast<DWORD_PTR>(1) << i, i});
+    std::stable_sort(groups.begin(), groups.end(), [](const SiblingGroup& a, const SiblingGroup& b) { return a.first < b.first; });
+    const DWORD need = entry * static_cast<DWORD>(groups.size());
+    if (!buffer || *len < need) {
+        *len = need;
+        t_last_error = ERROR_INSUFFICIENT_BUFFER;
+        return FALSE;
+    }
+    auto* out = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer);
+    for (size_t k = 0; k < groups.size(); ++k) {
         std::memset(out, 0, entry);
         out->Relationship = RelationProcessorCore;
         out->Size = entry;
-        out->Processor.EfficiencyClass = i < performance ? 1 : 0;
+        out->Processor.EfficiencyClass = groups[k].first < performance ? 1 : 0;
         out->Processor.GroupCount = 1;
-        out->Processor.GroupMask[0].Mask = static_cast<DWORD_PTR>(1) << i;
+        out->Processor.GroupMask[0].Mask = groups[k].mask;
         out = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(reinterpret_cast<unsigned char*>(out) + entry);
     }
     *len = need;

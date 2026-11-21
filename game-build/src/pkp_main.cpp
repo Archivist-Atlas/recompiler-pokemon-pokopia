@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// pkp.exe: Pokémon Pokopia (Switch 2, 0400A3A01EE4C000, 2.0.1) as a native Windows process.
+// pkp.exe: this cozy life-simulation and sandbox builder with fantastical creatures (Switch 2, 0400A3A01EE4C000, 2.0.1) as a native Windows process.
 //
 // This is the part of the process that Horizon's kernel and loader do before the first guest instruction:
 //   1. map the four NSOs of the ExeFS (rtld, main, sdk, subsdk0) at the bases the lifter baked into the generated code,
@@ -53,7 +53,7 @@
 #include "nxrt/runtime.h"
 #include "nxrt/services.h"
 
-#include "pkp/core/pkp_game.h"   // the Pokémon Pokopia game module (runtime/games/pkp): every title-specific table the runtime uses
+#include "pkp/core/pkp_game.h"   // the game module (runtime/games/pkp): every title-specific table the runtime uses
 
 #include "nx_modules.gen.h"     // NX_MODULES: the game's module list, generated from recomp/games/pkp/config.py
 
@@ -336,11 +336,11 @@ extern "C" int pkp_rt_main(int argc, char** argv, const PkpRtModules* mods) {
         char text[256];
         std::snprintf(text, sizeof text, "pkp.exe was built for runtime API %u, but this pkp_rt.dll is API %u: they come from different releases. Open the launcher and press Play: it says what to do.",
                       mods ? mods->api : 0u, PKP_RT_API);
-        MessageBoxA(nullptr, text, "Pokopia", MB_OK | MB_ICONERROR);
+        MessageBoxA(nullptr, text, "Recompia", MB_OK | MB_ICONERROR);
         return 3;
     }
     if (mods->count != sizeof kModules / sizeof kModules[0]) {
-        MessageBoxA(nullptr, "pkp.exe and pkp_rt.dll list different game modules. Run the launcher's Set up again.", "Pokopia", MB_OK | MB_ICONERROR);
+        MessageBoxA(nullptr, "pkp.exe and pkp_rt.dll list different game modules. Run the launcher's Set up again.", "Recompia", MB_OK | MB_ICONERROR);
         return 3;
     }
     for (uint32_t i = 0; i < mods->count; ++i) { kModules[i].nx = mods->mods[i]; kModules[i].abi = mods->abis[i]; }
@@ -398,13 +398,18 @@ int main(int argc, char** argv) {
             if (logp) { log_abs = absolute_utf8(logp); logp = log_abs.c_str(); }
             if (!SetCurrentDirectoryW(base.c_str())) die("cannot use the game folder %s", narrow_utf8(base).c_str());
             // One game (or one shader preparation) per game folder: two would write the same log, pipeline cache and saves. The name comes from
-            // the folder's full path; NXRT_ALLOW_MULTIPLE=1 lifts the check for test rigs.
+            // the folder's full path; NXRT_ALLOW_MULTIPLE=1 lifts the check for test rigs. Split screen's windows 2 to 4 (nxrt/split.h, set in
+            // the environment by the launcher, read here before the config is) run from the same folder with a log, controls.ini and save
+            // folder of their own and never write the pipeline cache, so each of them has a lock of its own; window 1 keeps the folder's.
             if (!std::getenv("NXRT_ALLOW_MULTIPLE")) {
                 std::wstring full(32768, L'\0');
                 full.resize(GetFullPathNameW(base.c_str(), static_cast<DWORD>(full.size()), full.data(), nullptr));
                 unsigned long long h = 1469598103934665603ull;
                 for (wchar_t ch : full) h = (h ^ static_cast<unsigned long long>(std::towlower(ch))) * 1099511628211ull;
-                const std::wstring name = L"Local\\PokopiaRecompPC_" + std::to_wstring(h);
+                std::wstring name = L"Local\\PokopiaRecompPC_" + std::to_wstring(h);
+                const char* split_window = std::getenv("NXRT_SPLIT_WINDOW");
+                const int window = split_window ? std::atoi(split_window) : 0;
+                if (window >= 2 && window <= 4) name += L"_window" + std::to_wstring(window);
                 if (CreateMutexW(nullptr, FALSE, name.c_str()) && GetLastError() == ERROR_ALREADY_EXISTS)
                     die("The game is already running from this folder (or its shaders are being prepared). Close that one first.");
             }
@@ -447,12 +452,14 @@ int main(int argc, char** argv) {
             nxrt::play::DisplayConfig disp;
             if (!headless) {
                 disp = nxrt::play::display();       // controls.ini: window size, present mode, frame cap
-                nxrt::platform::init();
+                nxrt::platform::InitOptions po;
+                po.place_windows = disp.places_window;
+                nxrt::platform::init(po);
                 nxrt::platform::WindowDesc wd;
-                const std::string full_title = std::string(nxrt::game::info().title) + " (Switch recomp) - F11: fullscreen";
-                wd.title = full_title.c_str();
+                wd.title = nxrt::game::info().product;
                 wd.width = disp.width;
                 wd.height = disp.height;
+                wd.focusable = disp.takes_focus;
                 if (!nxrt::platform::create_window(wd)) die("cannot create the game window. The game needs a graphics driver with Vulkan 1.3: update the driver for your graphics card and try again. The reason is in pkp.log.");
             }
             nxrt::gfx::DeviceDesc dd;
@@ -512,7 +519,7 @@ int main(int argc, char** argv) {
             m = nxrt::module_load_nso_memory(bytes.data(), bytes.size(), lo, &err);
         } else {
             if (!file_exists(widen_utf8(path)))
-                die("The game files were not found (%s). Choose your game files in the Pokopia launcher (or set [fs] exefs in pkp.ini), then start the game again.", path.c_str());
+                die("The game files were not found (%s). Choose your game files in the Recompia launcher (or set [fs] exefs in pkp.ini), then start the game again.", path.c_str());
             m = nxrt::module_load_nso_file(path.c_str(), lo, &err);
         }
         if (!m) die("cannot load %s: %s", path.c_str(), err.c_str());

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# The Pokémon Pokopia game module (docs/GAME_BOUNDARY.md, pkp_game.h). Libraries, each a superset of the one before:
+# The game module (docs/GAME_BOUNDARY.md, pkp_game.h). Libraries, each a superset of the one before:
 #   nxrt_game_pkp_data   identity, branding, factory controls.ini, the [pkp] key table (pure data)
 #   nxrt_game_pkp_core   + title facts, test probes (links nxrt)
 #   nxrt_game_pkp        + play-mode hooks (links nxrt_gfx; only with NXRT_BUILD_GFX). pkp.exe links this one.
@@ -28,6 +28,70 @@ target_link_libraries(nxrt_game_pkp_core PUBLIC nxrt_game_pkp_data nxrt)
 if(TARGET nxrt_gfx)
     add_library(nxrt_game_pkp STATIC
         # core
+        "${_pkp}/core/pkp_coop.cpp"
+        "${_pkp}/core/pkp_coop_bag.cpp"
+        "${_pkp}/core/pkp_coop_bags.cpp"
+        "${_pkp}/core/pkp_coop_catchup.cpp"
+        "${_pkp}/core/pkp_coop_curtain.cpp"
+        "${_pkp}/core/pkp_coop_events.cpp"
+        "${_pkp}/core/pkp_coop_gate.cpp"
+        "${_pkp}/core/pkp_coop_link.cpp"
+        "${_pkp}/core/pkp_coop_lock.cpp"
+        "${_pkp}/core/pkp_coop_notice.cpp"
+        "${_pkp}/core/pkp_coop_outcomes.cpp"
+        "${_pkp}/core/pkp_coop_recipes.cpp"
+        "${_pkp}/core/pkp_coop_discovery.cpp"
+        "${_pkp}/core/pkp_coop_unlocks.cpp"
+        "${_pkp}/core/pkp_coop_purchases.cpp"
+        "${_pkp}/core/pkp_coop_money.cpp"
+        "${_pkp}/core/pkp_coop_requests.cpp"
+        "${_pkp}/core/pkp_coop_session.cpp"
+        "${_pkp}/core/pkp_coop_story.cpp"
+        "${_pkp}/core/pkp_coop_quests.cpp"
+        "${_pkp}/core/pkp_coop_talk.cpp"
+        "${_pkp}/core/pkp_coop_gimmicks.cpp"
+        "${_pkp}/core/pkp_coop_trace.cpp"
+        "${_pkp}/core/pkp_coop_held.cpp"
+        "${_pkp}/core/pkp_coop_linkqueue.cpp"
+        "${_pkp}/core/pkp_coop_placement.cpp"
+        "${_pkp}/core/pkp_coop_contents.cpp"
+        "${_pkp}/core/pkp_coop_travel.cpp"
+        "${_pkp}/core/pkp_coop_wirelog.cpp"
+        "${_pkp}/core/pkp_coop_digest.cpp"
+        "${_pkp}/core/pkp_coop_records.cpp"
+        "${_pkp}/core/pkp_coop_role.cpp"
+        "${_pkp}/core/pkp_coop_jobs.cpp"
+        "${_pkp}/core/pkp_coop_friendship.cpp"
+        "${_pkp}/core/pkp_coop_challenges.cpp"
+        "${_pkp}/core/pkp_coop_feed.cpp"
+        "${_pkp}/core/pkp_coop_owner.cpp"
+        "${_pkp}/core/pkp_coop_newcomer.cpp"
+        "${_pkp}/core/pkp_coop_doors.cpp"
+        "${_pkp}/core/pkp_coop_title.cpp"
+        "${_pkp}/core/pkp_coop_takeout.cpp"
+        "${_pkp}/core/pkp_coop_deposit.cpp"
+        "${_pkp}/core/pkp_coop_follow.cpp"
+        # the one shared save
+        "${_pkp}/core/pkp_coop_saveset.cpp"
+        "${_pkp}/core/pkp_coop_savecopy.cpp"
+        "${_pkp}/core/pkp_coop_talkrec.cpp"
+        "${_pkp}/core/pkp_coop_drop.cpp"
+        "${_pkp}/core/pkp_journal.cpp"
+        "${_pkp}/core/pkp_journal_feature.cpp"
+        "${_pkp}/core/pkp_journal_actor.cpp"
+        "${_pkp}/core/pkp_journal_events.cpp"
+        "${_pkp}/core/pkp_journal_talk.cpp"
+        "${_pkp}/core/pkp_journal_roles.cpp"
+        "${_pkp}/core/pkp_journal_quests.cpp"
+        "${_pkp}/core/pkp_journal_items.cpp"
+        "${_pkp}/core/pkp_journal_travel.cpp"
+        "${_pkp}/core/pkp_journal_interact.cpp"
+        "${_pkp}/core/pkp_journal_services.cpp"
+        "${_pkp}/core/pkp_journal_services_queue.cpp"
+        "${_pkp}/core/pkp_journal_services_work.cpp"
+        "${_pkp}/core/pkp_journal_services_requests.cpp"
+        "${_pkp}/core/pkp_journal_services_shop.cpp"
+        "${_pkp}/core/pkp_journal_services_discovery.cpp"
         "${_pkp}/core/pkp_game.cpp"
         "${_pkp}/core/pkp_link_digspots.cpp"
         "${_pkp}/core/pkp_link_trips.cpp"
@@ -39,9 +103,6 @@ if(TARGET nxrt_gfx)
         "${_pkp}/core/pkp_save_files.cpp"
         "${_pkp}/core/pkp_save_uuid.cpp"
         "${_pkp}/core/pkp_settings.cpp"
-        "${_pkp}/core/pkp_story_guard.cpp"
-        "${_pkp}/core/pkp_story_hold.cpp"
-        "${_pkp}/core/pkp_story_pickups.cpp"
         "${_pkp}/core/pkp_view_offset.cpp"
         # render
         "${_pkp}/render/pkp_render_size.cpp"
@@ -64,6 +125,8 @@ if(TARGET nxrt_gfx)
         "${_pkp}/input/pkp_aim_debug.cpp"
         "${_pkp}/input/pkp_jump.cpp"
         "${_pkp}/input/pkp_kbm.cpp"
+        "${_pkp}/input/pkp_prompt_icons.cpp"
+        "${_pkp}/input/pkp_baked_prompts.cpp"
         # ui
         "${_pkp}/ui/pkp_menu.cpp"
         "${_pkp}/ui/pkp_menu_scan.cpp"
@@ -78,18 +141,24 @@ if(TARGET nxrt_gfx)
         "${_pkp}/ui/pkp_options_time.cpp"
         "${_pkp}/ui/pkp_options_items.cpp"
         "${_pkp}/ui/pkp_options_online.cpp"
+        "${_pkp}/ui/pkp_options_icons.cpp"
         "${_pkp}/ui/pkp_key_guide.cpp"
+        "${_pkp}/ui/pkp_cross_guide.cpp"
         "${_pkp}/ui/pkp_title.cpp"
         "${_pkp}/ui/pkp_sort.cpp"
+        "${_pkp}/ui/pkp_box_tabs.cpp"
+        "${_pkp}/ui/pkp_box_tabs_carry.cpp"
         "${_pkp}/ui/pkp_craft.cpp"
         "${_pkp}/ui/pkp_save_now.cpp"
         "${_pkp}/ui/pkp_item_edit.cpp"
         "${_pkp}/ui/pkp_time.cpp")
     if(NXRT_TESTTOOLS)
         target_sources(nxrt_game_pkp PRIVATE
+            "${_pkp}/test/pkp_coop_probe.cpp"
             "${_pkp}/test/pkp_movie_test.cpp"
             "${_pkp}/test/pkp_taa_probe.cpp")   # test-only features (pkp_game.cpp, NXRT_TESTTOOLS)
     endif()
     target_link_libraries(nxrt_game_pkp PUBLIC nxrt_game_pkp_core nxrt_gfx PRIVATE nxrt_miniz)
     target_sources(nxrt_game_pkp PRIVATE "${_pkp}/render/pkp_render_info.cpp")   # game::Info::render (nxrt/game_render.h)
+    target_sources(nxrt_game_pkp PRIVATE "${_pkp}/core/pkp_strings.cpp")   # our own strings in the game's language (pkp_strings.h)
 endif()

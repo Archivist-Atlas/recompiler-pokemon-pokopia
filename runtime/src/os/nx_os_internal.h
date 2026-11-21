@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// nx_os_internal.h: the object model shared by the three files of the POSIX shim (os_posix.cpp, os_posix_file.cpp,
-// os_posix_mem.cpp). Internal to src/os -- the rest of the runtime only sees src/os/nx_os.h.
+// nx_os_internal.h: the object model shared by the files of the POSIX shim (os_posix*.cpp). Internal to src/os -- the
+// rest of the runtime only sees src/os/nx_os.h.
 //
 // One definition of Obj and one Kind enum, so that a HANDLE made by one file (a file handle from CreateFileW) can be
 // passed to a function in another (CloseHandle). A per-file copy of these structs would compile and then be undefined
@@ -73,10 +73,24 @@ struct ThreadObj : Obj {
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
     uint64_t cpu_ns = 0;
+#if defined(__linux__)
+    // SuspendThread on a running thread (os_posix_suspend.cpp): the stop signal's handler saves the registers here and
+    // waits on `sig_state` until ResumeThread lets it go. `sig_depth` counts the SuspendThread calls while it is stopped;
+    // `sig_tid` is the kernel thread id the signal goes to (0 until the thread runs).
+    std::atomic<int> sig_state{0};
+    std::atomic<pid_t> sig_tid{0};
+    int sig_depth = 0;
+    pthread_mutex_t sig_mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t sig_pc = 0, sig_sp = 0, sig_fp = 0, sig_lr = 0;
+    uint64_t sig_x[29] = {};
+#endif
     explicit ThreadObj() : Obj(Kind::Thread) {}
     ~ThreadObj() override {
         pthread_mutex_destroy(&mu);
         pthread_cond_destroy(&cv);
+#if defined(__linux__)
+        pthread_mutex_destroy(&sig_mu);
+#endif
     }
 };
 
@@ -95,8 +109,12 @@ struct MutexObj : Waitable {
     DWORD owner = 0;
     int depth = 0;
     std::string name;
+    int claim_fd = -1;   // a named mutex's lock file, held shared while this process has the name open (os_posix_named.cpp)
     MutexObj() : Waitable(Kind::Mutex) {}
-    ~MutexObj() override { pthread_mutex_destroy(&mu); }
+    ~MutexObj() override {
+        if (claim_fd >= 0) ::close(claim_fd);
+        pthread_mutex_destroy(&mu);
+    }
 };
 
 struct SemaphoreObj : Waitable {
@@ -164,6 +182,11 @@ T* as(HANDLE h, Kind k) {
 void retain(Obj* o);
 void release(Obj* o);
 
+// ---- names other processes see (os_posix_named.cpp) ---------------------------------------------------------------
+// Holds `name` for this process until the returned fd is closed; *others = another process holds it too. -1 when no
+// lock file can be made: the name then stays known to this process only.
+int named_claim(const std::string& name, bool* others);
+
 // ---- shared wait plumbing ----------------------------------------------------------------------------------------
 // One process-wide condition variable and one mutex: see the comment at the top of os_posix.cpp.
 extern pthread_mutex_t g_wait_mu;
@@ -177,6 +200,19 @@ void consume(Obj* o);
 // ---- shared identity and conversion helpers ----------------------------------------------------------------------
 DWORD self_tid();
 ThreadObj* self_thread();   // the calling thread's object, created on first use
+ThreadObj* thread_if_known();   // the calling thread's object, or nullptr; never allocates (callable from a signal handler)
+
+#if defined(__linux__)
+// ---- stopping a running thread (os_posix_suspend.cpp) --------------------------------------------------------------
+// SuspendThread / ResumeThread / GetThreadContext for a thread that is running: a signal stops it in its handler. *prev
+// is the Win32 previous suspend count. signal_suspend: false when the thread is not running or did not stop in time;
+// signal_resume: false when signal_suspend did not stop it (the caller's CREATE_SUSPENDED path applies);
+// signal_context: false when it is not stopped.
+bool signal_suspend(ThreadObj* t, DWORD* prev);
+bool signal_resume(ThreadObj* t, DWORD* prev);
+bool signal_context(ThreadObj* t, CONTEXT* ctx);
+void note_kernel_tid(ThreadObj* t);   // on the thread itself, when it starts
+#endif
 uint64_t filetime_of(const struct timespec& ts);
 void set_filetime(FILETIME* ft, uint64_t v);
 std::string native_path(const char* p);   // backslashes to slashes

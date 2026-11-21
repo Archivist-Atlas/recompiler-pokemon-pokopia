@@ -2,7 +2,7 @@
 // Offline network services (S3c): nifm, bsd, bsdcfg, ssl, nim:eca, friend, prepo, pctl, bcat, ldn, nsd, sfdnsres, ntc, ngct, ngc, notif.
 // The console has no network connection, no friends and no BCAT data. Every command answers what a console in that state gives. The one
 // exceptions are ldn (local wireless over the relay server: services/ldn.cpp registers ldn:u's objects, this file the name) and bsd's UDP
-// sockets, which run on the virtual local-wireless LAN (net/vsock.h) when ldn has a vnet link up, or on pokopia-native's co-op module
+// sockets, which run on the virtual local-wireless LAN (net/vsock.h) when ldn has a vnet link up, or on the parent project's co-op module
 // ([net] protocol = native: descriptors 0x100..0x11F, coop_vnet_*).
 // Adapted from ScarletNX (GPL-3.0-or-later): src/nx/hle/services/network/nifm.swipc, bsd.swipc, ssl.swipc, dns.swipc, ldn.swipc and
 //   src/nx/hle/services/misc.swipc (pctl, friend, prepo, bcat, ngct, nsd). Command ids, names and layouts.
@@ -35,7 +35,7 @@ void register_network() {
     const bool offline = config_get_bool("net", "offline", true);
     NXLOG_I("net", "network services: [net] offline=%s (no connection, no friends, no BCAT data in either mode)", offline ? "true" : "false");
 
-    if (online_test()) NXLOG_I("net", "[net] online_test = on: nifm and ntc report online, delivery cache empty, no sockets");
+    if (report_online()) NXLOG_I("net", "report online ([net] online_test or the game): nifm and ntc report online, delivery cache empty, no sockets");
 
     for (const char* n : {"nifm:u", "nifm:a", "nifm:s"}) add(n, [] { return make_nifm_static(); });
     for (const char* n : {"bsd:u", "bsd:a", "bsd:s"}) add(n, [] { return make_bsd(); });

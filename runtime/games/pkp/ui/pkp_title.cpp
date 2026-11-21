@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Pokémon Pokopia, title screen: a "Quit Game" key guide next to "(-) Settings" (issue #319). [pkp] title_quit, on by default.
+// Game layer, title screen: a "Quit Game" key guide next to "(-) Settings" (issue #319). [pkp] title_quit, on by default.
 //
 // The title's prompts are the game's key guide widget (pkp_key_guide.h): 0x7100e60be4 (manager, player, set) gives it a key guide set, and
 // the title uses set 152 = {233}: action 0x80 (the (-) button) and "Settings". A key guide client (pkp_key_guide.h):
@@ -13,6 +13,7 @@
 // "Close the game?" prompt. A click on the prompt sends (+) too (the key guide's click routing, pkp_menu.cpp).
 #include "ui/pkp_title.h"
 #include "core/pkp_guest.h"
+#include "core/pkp_language.h"
 #include "ui/pkp_key_guide.h"
 #include "core/pkp_layout.h"
 #include "core/pkp_settings.h"
@@ -24,7 +25,6 @@ namespace nxrt::games::pkp {
 namespace {
 
 constexpr const char* kTag = "pkp";
-using layout::kLanguage;
 constexpr uint32_t kTitleSet = 152, kQuitGuide = 267;
 
 // "Quit Game" in the game's languages (0..8, the order of its text banks: the key guide bank's own "Settings" / "Quit" words checked)
@@ -73,9 +73,8 @@ void set_taken(::Ctx* c, uint64_t widget, uint32_t set) {
 
 void part_filled(::Ctx* c, const key_guide::Part& p) {
     if (!g.widget || !g.row || p.row != g.row || p.widget != g.widget) return;
-    const uint64_t lp = rd<uint64_t>(g.base + kLanguage);
-    const uint32_t lang = lp && ok(lp, 4) ? rd<uint32_t>(lp) : 1;
-    key_guide::set_text(c, p, kLabel[lang < 9 ? lang : 1]);
+    const uint32_t lang = language::index(g.base);
+    key_guide::set_text(c, p, kLabel[lang]);
     const uint64_t lay = key_guide::layout_of(c, p);   // for the menu pointer: a click on it is (+)
     key_guide::set_click_layout(g.client, lay);
     NXLOG_I(kTag, "title quit: prompt text set (part 0x%llx, slot %u, language %u, layout 0x%llx)", static_cast<unsigned long long>(p.part), p.slot,

@@ -18,11 +18,14 @@
 #include "nxrt/input.h"
 #include "nxrt/log.h"
 
-#if defined(_WIN32)
-#include <windows.h>
-#elif defined(__APPLE__)
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 namespace nxrt::platform {
@@ -409,7 +412,8 @@ bool init(const InitOptions& opt) {
     // it can through X11 (XWayland) but not on a native Wayland surface; SDL 3 picks Wayland first on a compositor such as
     // KDE Plasma 6, and the pad goes silent. Steam sets SteamGameId
     // for its own games and non-Steam shortcuts alike. A hint only: SDL_VIDEO_DRIVER from the player still wins.
-    if (std::getenv("SteamGameId") || std::getenv("SteamAppId")) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
+    // The same order for a caller that places its window (place_window): Wayland has no protocol for a window to set its position.
+    if (opt.place_windows || std::getenv("SteamGameId") || std::getenv("SteamAppId")) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
 #endif
     // Hints must be set before SDL_Init. Raw, unaccelerated relative mouse; gamepads keep reporting when the window is
     // in the background.
@@ -466,6 +470,7 @@ bool create_window(const WindowDesc& desc) {
     SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (desc.resizable) flags |= SDL_WINDOW_RESIZABLE;
     if (desc.hidden || config_get_bool("gfx", "hidden", false)) flags |= SDL_WINDOW_HIDDEN;
+    if (!desc.focusable) flags |= SDL_WINDOW_NOT_FOCUSABLE;
 
     g_window = SDL_CreateWindow(desc.title ? desc.title : "nxrt", desc.width, desc.height, flags);
     if (!g_window) {
@@ -474,15 +479,12 @@ bool create_window(const WindowDesc& desc) {
     }
 #if defined(_WIN32)
     if (HWND hwnd = static_cast<HWND>(native_hwnd())) {
-        HINSTANCE hinst = GetModuleHandleW(nullptr);
-        if (HICON big_icon = static_cast<HICON>(LoadImageW(hinst, MAKEINTRESOURCEW(1), IMAGE_ICON,
-                                                            GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR))) {
-            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big_icon));
-        }
-        if (HICON small_icon = static_cast<HICON>(LoadImageW(hinst, MAKEINTRESOURCEW(1), IMAGE_ICON,
-                                                              GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR))) {
-            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
-        }
+        HINSTANCE inst = GetModuleHandleW(nullptr);
+        if (HANDLE big = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED))
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
+        if (HANDLE small_ico = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                          GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED))
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_ico));
     }
 #endif
     int pw = 0, ph = 0;

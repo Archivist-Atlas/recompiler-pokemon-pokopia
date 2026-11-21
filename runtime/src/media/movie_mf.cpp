@@ -348,11 +348,10 @@ bool ext_open(Ext* e, unsigned char* data, size_t size) {
     st.Attach(SHCreateMemStream(data, static_cast<UINT>(size)));   // copies the bytes
     if (!st) return false;
 #if defined(__MINGW32__)
-    using CreateBSFn = HRESULT(WINAPI*)(IStream*, IMFByteStream**);
-    HMODULE mfplat = GetModuleHandleW(L"mfplat.dll");
-    if (!mfplat) mfplat = LoadLibraryW(L"mfplat.dll");
-    auto create_bs = mfplat ? reinterpret_cast<CreateBSFn>(GetProcAddress(mfplat, "MFCreateMFByteStreamOnStream")) : nullptr;
-    HRESULT hr = create_bs ? create_bs(st.Get(), &e->bs) : E_NOTIMPL;
+    using PfnCreateBS = HRESULT (STDAPICALLTYPE*)(IStream*, IMFByteStream**);
+    static const auto pfn_create_bs = reinterpret_cast<PfnCreateBS>(
+        GetProcAddress(LoadLibraryW(L"mfplat.dll"), "MFCreateMFByteStreamOnStream"));
+    HRESULT hr = pfn_create_bs ? pfn_create_bs(st.Get(), &e->bs) : E_NOTIMPL;
 #else
     HRESULT hr = MFCreateMFByteStreamOnStream(st.Get(), &e->bs);
 #endif
@@ -1484,7 +1483,7 @@ bool install_movie_hle() {
     static std::once_flag once;
     static bool ok = false;
     std::call_once(once, [] {
-        // Switch 2's movie:: (Pokopia's subsdk0) is a compatibility layer with virtual Extractor/Decoder objects over nn::movie and
+        // Switch 2's movie:: (the game's subsdk0) is a compatibility layer with virtual Extractor/Decoder objects over nn::movie and
         // nn::codec: these Switch 1 handlers (a marker where it keeps a vtable) would break it. There the decoders answer on the host
         // one level down instead (src/media/video_codec.cpp).
         // [media] movie is not read there: Media Foundation never takes these imports on Switch 2.

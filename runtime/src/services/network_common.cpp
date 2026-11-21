@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Offline network services, shared part: the process state, the first-use and "ask:" logs, and the command-table helpers (see network.cpp).
 #include "network_internal.h"
+#include "network_cloud.h"
 
 #include <atomic>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "nxrt/config.h"
+#include "nxrt/game.h"
 #include "nxrt/kernel.h"
 #include "nxrt/log.h"
 #include "../net/vnet.h"
@@ -50,9 +52,13 @@ void note(std::atomic<uint32_t>& logged, const char* svc, uint32_t id, const cha
 
 }  // namespace
 
-// [net] online_test, read once: nifm and ntc report online (nothing reaches the network: bsd and BCAT answer as before).
-bool online_test() {
-    static const bool on = config_get_bool("net", "online_test", false);
+// Read once: nifm and ntc report online when [net] online_test is on, a Cloud Islands server is set ([net] cloud_server) or the game asks for it (game::Info::report_online). Nothing reaches
+// the network: bsd and BCAT answer as before.
+bool report_online() {
+    static const bool on = [] {
+        const game::Info& g = game::info();
+        return config_get_bool("net", "online_test", false) || cloud::enabled() || (g.report_online && g.report_online());
+    }();
     return on;
 }
 
@@ -239,3 +245,7 @@ void echo_in_to_out(const ipc::Request& req) {
 }
 
 }  // namespace nxrt::services::netsvc
+
+namespace nxrt::services {
+bool net_report_online() { return netsvc::report_online(); }
+}  // namespace nxrt::services

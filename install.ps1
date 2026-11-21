@@ -1,4 +1,4 @@
-# Pokemon Pokopia (Recompia / pokopia-recomp) installer for Windows (driven by NUP Studio)
+﻿# Pokemon Pokopia (Recompia / pokopia-recomp) installer for Windows (driven by NUP Studio)
 param(
     [string]$Nup = "",
     [string]$Dir = "",
@@ -309,6 +309,13 @@ if (-not (Test-Path -LiteralPath $spirvResults)) {
     & $harnessExe --batch $corpusDir --out $spirvDir --jobs $shaderJobs --no-val
     if ($LASTEXITCODE -ne 0) { Say "spirv_harness failed"; exit 1 }
     Remove-Item -Recurse -Force -LiteralPath $corpusDir -ErrorAction SilentlyContinue
+}
+
+# Bundle spirv_harness next to pkp.exe for live on-the-fly translation of any runtime-discovered shaders
+$harnessCache = Join-Path $env:LOCALAPPDATA "Switch2Recomp\_cache\pokopia_spirv_harness"
+$harnessDst = Join-Path $Dir "spirv_harness"
+if ((Test-Path -LiteralPath (Join-Path $harnessCache "spirv_harness.exe")) -and (-not (Test-Path -LiteralPath (Join-Path $harnessDst "spirv_harness.exe")))) {
+    Copy-Item -LiteralPath $harnessCache -Destination $harnessDst -Recurse -Force
 }
 
 # Compact loose .spv files into shader_cache/spirv.archive/000000.pack (NXSPACK1 + zstd) to save ~15+ GB on NTFS

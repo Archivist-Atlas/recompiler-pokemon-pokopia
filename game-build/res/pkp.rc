@@ -2,7 +2,6 @@
 // Resources for pkp.exe: the manifest (UTF-8 code page, long paths, asInvoker) and the version information.
 // PKP_VER_MAJOR / MINOR / PATCH and PKP_VER_TEXT come from the build (game-build/CMakeLists.txt, -DPKP_VERSION=0.1.0).
 #include <winres.h>
-#include "pkp_ver.h"
 
 #ifndef PKP_VER_MAJOR
 #define PKP_VER_MAJOR 0
@@ -30,11 +29,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", ""
-            VALUE "FileDescription", "Pokémon Pokopia PC"
+            VALUE "FileDescription", "Recompia"
             VALUE "FileVersion", PKP_VER_TEXT
             VALUE "InternalName", "pkp"
             VALUE "OriginalFilename", "pkp.exe"
-            VALUE "ProductName", "Pokémon Pokopia PC"
+            VALUE "ProductName", "Recompia"
             VALUE "ProductVersion", PKP_VER_TEXT
         END
     END

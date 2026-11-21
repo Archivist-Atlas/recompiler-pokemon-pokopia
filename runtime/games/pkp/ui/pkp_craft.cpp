@@ -30,13 +30,14 @@
 //    heap blocks (0x7101121ee8 ([main+0x3483d58] -> allocator, 3, size, 0x10, &{u32 0x35, u64 0})), kept for the session.
 //  * The button: the screen's prompts are the key guide widget (pkp_key_guide.h; this is a client) fed set 26 ({Confirm, Close, Favorite};
 //    only the crafting screen's browsing state uses it). When the widget takes the set, key guide 158 (the game's own "Search", the
-//    Pokédex's) is put in the set's first free slot (the widget lays out six), and when its part is filled its icon becomes Y (action 0x97),
+//    creature list's) is put in the set's first free slot (the widget lays out six), and when its part is filled its icon becomes Y (action 0x97),
 //    its text "Search: <word>" while a word is active (the widget takes set 26 again after a new word), and its layout goes to the menu
 //    pointer (the key guide's click routing, pkp_menu.cpp): a click on it asks too. Y is free in this screen (A Confirm, B Close, X Sort,
 //    (+) Favorite, (-) Details, L / R tabs).
 //  * Link Play (0x71000376c4 true): the list is local UI, but the key guide is left as the game has it and nothing is filtered.
 #include "ui/pkp_craft.h"
 #include "core/pkp_guest.h"
+#include "core/pkp_language.h"
 #include "core/pkp_items.h"
 #include "ui/pkp_key_guide.h"
 #include "core/pkp_layout.h"
@@ -75,7 +76,6 @@ constexpr uint64_t kAlloc = 0x1121ee8;           // (allocator, 3, size, align, 
 constexpr uint64_t kAllocator = 0x3483d58;
 using layout::kOnline;
 constexpr uint64_t kRecipeTable = 0x330;
-using layout::kLanguage;
 constexpr uint64_t kChildren = 0x48, kState = 0xa8;
 constexpr uint32_t kGridElem = 0x1fd, kDetailElem = 0x1ff;
 constexpr uint16_t kGridClass = 0xe4, kDetailClass = 0xe5;
@@ -119,12 +119,6 @@ struct State {
     std::atomic<bool> click{false};
 };
 State g;
-
-uint32_t language() {
-    const uint64_t p = rd<uint64_t>(g.base + kLanguage);
-    const uint32_t l = p && ok(p, 4) ? rd<uint32_t>(p) : 1;
-    return l < 9 ? l : 1;
-}
 
 // A data-table record (record [row + 8]; the table at +0 while the manager does not hold `off`, pkp_tables.h); 0 if none.
 uint64_t table_rec(::Ctx* c, uint64_t off, uint32_t id) {
@@ -172,7 +166,7 @@ std::string fold(const std::string& s) {
 
 // The folded name of a recipe's result item, looked up once per language.
 const std::string& recipe_name(::Ctx* c, uint16_t rid) {
-    const uint32_t lang = language();
+    const uint32_t lang = language::index(g.base);
     if (lang != g.lang) { g.names.clear(); g.lang = lang; }
     auto it = g.names.find(rid);
     if (it != g.names.end()) return it->second;
@@ -269,7 +263,7 @@ void ask(::Ctx* c, uint64_t screen) {
         NXLOG_W(kTag, "craft search: no guest memory for the keyboard");
         return;
     }
-    const uint32_t lang = language();
+    const uint32_t lang = language::index(g.base);
     std::memset(reinterpret_cast<void*>(g.buf), 0, 0x100);
     std::memcpy(reinterpret_cast<void*>(g.buf), g.query.data(), std::min<size_t>(g.query.size(), 0xff));
     std::memset(reinterpret_cast<void*>(g.opts), 0, 0x20);
@@ -387,7 +381,7 @@ void part_filled(::Ctx* c, const key_guide::Part& p) {
     std::string label;
     {
         std::lock_guard<std::mutex> lk(g.mu);
-        if (!g.query.empty()) label = std::string(kSearchWord[language()]) + ": " + g.query;
+        if (!g.query.empty()) label = std::string(kSearchWord[language::index(g.base)]) + ": " + g.query;
     }
     if (!label.empty()) key_guide::set_text(c, p, label.c_str());
     key_guide::set_click_layout(g.client, key_guide::layout_of(c, p));

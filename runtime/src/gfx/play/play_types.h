@@ -3,12 +3,12 @@
 //
 // Vocabulary:
 //   input    a physical thing on the keyboard or mouse: a key (SDL scancode), a mouse button or a wheel notch.
-//   action   what the player wants the game to do (Pokopia: "move_forward", "btn_a", "dpad_up"). The game only knows the Switch pad,
+//   action   what the player wants the game to do (the game: "move_forward", "btn_a", "dpad_up"). The game only knows the Switch pad,
 //            so every action is tied to a Switch output (buttons and stick directions) by the [switch] table of the settings file.
 //   context  where the player is: in play, on the map, in a menu.
 //            `all` is a layer under every context.
 // The action and context slots are generic; the registered game may name them and give their factory outputs and the launcher's labels
-// (GameVocabulary below). Pokopia uses the generic names.
+// (GameVocabulary below). The game uses the generic names.
 //   trigger  how an input turns into an action: press (while held), tap (a short pulse after a quick release), hold (after a delay,
 //            while held), toggle (each press flips it), doubletap (a second quick press, while held).
 // A binding says "in this context, this input drives this action with this trigger".
@@ -46,8 +46,8 @@ enum class Act : uint8_t {
     DpadUp, DpadDown, DpadLeft, DpadRight,
     // raw Switch buttons
     BtnA, BtnB, BtnX, BtnY, BtnL, BtnR, BtnZL, BtnZR, BtnPlus, BtnMinus, BtnLStick, BtnRStick,
-    // a game-side switch with no Switch output (pkp: the Joy-Con 2 mouse mode, toggled by each activation)
-    MouseMode,
+    // Game-side actions with no default Switch output.
+    MouseMode, Save,
     kCount
 };
 constexpr int kActCount = static_cast<int>(Act::kCount);
@@ -141,7 +141,7 @@ struct PadSettings {
     bool label_abxy = false;       // false (default): Switch layout, by position (right = Switch A, bottom = B); true: Xbox layout, by label (A = A)
     double stick_deadzone = 0.10;  // left stick, radial, 0..0.5, applied before the game's own dead zone
     double right_deadzone = 0.10;  // right stick (looking), same rule
-    double stick_max = 0.92;       // left stick, 0.5..1: the fraction of the travel that counts as full deflection (1 = off). A pad whose stick tops out below 1 (a worn pad, a DualSense near 0.96) reaches full speed with this lowered. Default 0.92 as in pokopia-native
+    double stick_max = 0.92;       // left stick, 0.5..1: the fraction of the travel that counts as full deflection (1 = off). A pad whose stick tops out below 1 (a worn pad, a DualSense near 0.96) reaches full speed with this lowered. Default 0.92 as in the parent project
     double right_stick_max = 0.92; // right stick (looking), same rule
     bool invert_y = false;         // right stick up looks down (in play only: menus and the map keep the stick as it is). Stacks with the game's own option.
     double look_sens = 1.0;        // 0.25..3: the right stick's deflection is multiplied by this in play (below 1 the turn speed tops out lower, above 1 it tops out sooner)
@@ -197,6 +197,8 @@ struct DisplaySettings {
     bool fast_gpu_memory = true;   // device-local copies of the pools draws read ([nvn] pool_mirror = on); costs up to 2 GiB of video memory
     bool fewer_gpu_waits = true;   // no full barrier after passes that only wrote their attachments ([nvn] pass_barriers = tracked)
     bool shader_prewarm = true;    // build the pipelines recorded by earlier runs ahead of the draws ([nvn] prewarm); at the next start, [nvn] prewarm in the ini wins
+    // Uniform blocks from video memory: auto (discrete GPUs under 7 GiB or without resizable BAR), on or off; becomes [nvn] uniform_snapshot at the next start unless the ini or the environment set it
+    std::string uniform_snapshot = "auto";
     std::string astc_quality = "high";   // ASTC texture quality on this GPU: fast, high or uncompressed (RGBA8, lots of video memory); becomes [gfx] astc_quality at the next start unless the ini or the environment set it
     // The display the window lives on, 1-based in the system's order; 0 = automatic (wherever the window opens). Applied live (the window moves).
     int monitor = 0;
@@ -259,10 +261,9 @@ struct FpsSettings {
 // ---- quit shortcut ------------------------------------------------------------------------------------------------------------
 // A pad combination and a keyboard key that open the overlay's "Close the game?" prompt (the same prompt as the F1 page's Quit button).
 // Neither reaches the game. The pad buttons are physical ones (before [padmap]), all held on one pad.
-constexpr int32_t kScancodeEscape = 41;                  // SDL_SCANCODE_ESCAPE
 struct QuitSettings {
     uint32_t pad = pad_src_bit(PadSrc::Back) | pad_src_bit(PadSrc::Start);   // [quit] pad: bits of PadSrc, 0 = off (Select + Start)
-    InputId key = {InKind::Key, kScancodeEscape};                                              // [quit] key: Esc opens quit prompt by default
+    InputId key = {};                                                        // [quit] key: a keyboard key, kind None = off
 };
 
 // ---- overlay shortcut ---------------------------------------------------------------------------------------------------------
@@ -363,7 +364,7 @@ const char* key_wheel_cycles();
 //              controller (all, or the one pad's player number, 1 = the first)
 //   [timing]   tap_ms hold_ms double_ms pulse_ms
 //   [display]  window_mode vsync fps_limit (number, 0 = unlimited, auto = refresh rate; fps_cap is read too) width height keep_aspect render_scale render_width render_height aspect fov_offset
-//              dynamic_resolution anisotropy lod_bias bloom chromatic_aberration fast_gpu_memory fewer_gpu_waits shader_prewarm astc_quality (fast high uncompressed)
+//              dynamic_resolution anisotropy lod_bias bloom chromatic_aberration fast_gpu_memory fewer_gpu_waits shader_prewarm uniform_snapshot (auto on off) astc_quality (fast high uncompressed)
 //              monitor (auto or the display's number, 1 = the first)
 //   [hdr]      mode (off auto on) format (auto hdr10 scrgb) peak_nits (0 = auto, else 200..10000) paper_white_nits (0 = auto, else
 //              80..500) highlight_boost (0..2)

@@ -83,6 +83,12 @@ struct Frame {
     // Host-visible memory valid until the submission has completed: small per-draw data (support buffer, driver constants,
     // inline uniform data). align is a power of two.
     UploadAlloc upload(VkDeviceSize size, VkDeviceSize align);
+    // Like upload, from the slot's own upload memory only: empty when it is full (no staging buffer is made).
+    UploadAlloc upload_ring(VkDeviceSize size, VkDeviceSize align);
+    // Device-local, host-visible memory valid until the submission has completed: upload_ring when the slot's upload memory is in video
+    // memory, else a small ring of the slot's own in video memory made on first use. Empty when full or when no video memory was left for
+    // it. Only callers that read nothing from it otherwise (uniform snapshots) take it: it is made only for them.
+    UploadAlloc vram_ring(VkDeviceSize size, VkDeviceSize align);
     // A staging buffer for texture data (own buffer when large). Freed when the submission has completed.
     UploadAlloc staging(VkDeviceSize size);
     // A staging buffer somebody else made and filled (background texture preparation): freed like the ones above when the submission has completed.
@@ -100,9 +106,10 @@ uint64_t completed_serial();      // cached timeline value; call poll_completed(
 uint64_t poll_completed();
 uint64_t current_serial();        // the serial of the submission being recorded (or the last one)
 
-// ---- GPU pass profiler ([prof] gpu_passes = true, needs the frame trace) --------------------------------------------------------------
+// ---- GPU pass profiler (nvn_gpu_timing.h) --------------------------------------------------------------------------------------------
 // Writes a GPU timestamp after everything recorded so far; the time since the previous stamp of the submission becomes a trace event
-// `gp:<label>` (arg = draws or 0). No-ops when the profiler is off.
+// `gp:<label>` (arg = draws or 0) with [prof] gpu_passes and the frame trace, and a row of the performance report's pass sample when it
+// samples this frame. gpass_on(): the submission being recorded is stamped; both no-ops otherwise.
 bool gpass_on();
 void gpass_stamp(Frame& f, const char* label, uint32_t arg = 0);
 

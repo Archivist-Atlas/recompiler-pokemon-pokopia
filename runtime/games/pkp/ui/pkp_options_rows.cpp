@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // In-game Options, the rows of the PC settings tabs (pkp_options_internal.h): each binds to a field of the play-mode Settings behind
-// controls.ini, the same store as the F1 page, except the Gameplay tab's, which bind to the gameplay mods' [pkp] keys of the game ini.
+// controls.ini, the same store as the F1 page, except the Gameplay and Inventory tabs', which bind to the gameplay mods' [pkp] keys of the game
+// ini.
 // Nothing reaches the save file.
 #include "ui/pkp_options_internal.h"
 
@@ -57,6 +58,7 @@ constexpr const char* kAheadNames[] = {"No Limit", "0", "1", "2", "3"};
 constexpr const char* kAaNames[] = {"Off", "SMAA Low", "SMAA Medium", "SMAA High", "SMAA Ultra"};      // indexed by extras::AaMode
 constexpr const char* kShadowNames[] = {"Game Default", "High (2x)", "Very High (3x)", "Ultra (4x)", "Extreme (8x)"};      // indexed by extras::ShadowQuality
 constexpr const char* kAstcKeys[] = {"fast", "high", "uncompressed"};
+constexpr const char* kUniformSnapshotKeys[] = {"auto", "on", "off"};
 constexpr const char* kWindowKeys[] = {"windowed", "borderless", "exclusive"};
 constexpr extras::UpscaleMode kUpscalers[] = {extras::UpscaleMode::Off, extras::UpscaleMode::Fsr1, extras::UpscaleMode::Nearest};
 
@@ -168,6 +170,9 @@ const Row kGraphics[] = {
     choice("Texture Compression", "Fast loads quickest; Uncompressed uses a lot of video memory.", {"Fast", "High", "Uncompressed"}, 3,
            [](const S& s) { return key_index(kAstcKeys, 3, s.display.astc_quality); }, [](S& s, int v) { s.display.astc_quality = kAstcKeys[v]; }, true),
     choice("Faster GPU Memory", "Uses more video memory for smoother drawing.", kOffOn, 2, ROW_BOOL(display.fast_gpu_memory), true),
+    choice("Constants in Video Memory", "Auto helps graphics cards under 8 GB. Off: read them from system memory as before.", {"Auto", "On", "Off"}, 3,
+           [](const S& s) { return key_index(kUniformSnapshotKeys, 3, s.display.uniform_snapshot); },
+           [](S& s, int v) { s.display.uniform_snapshot = kUniformSnapshotKeys[v]; }, true),
     choice("Fewer GPU Waits", "Skips pipeline waits that are not needed.", kOffOn, 2, ROW_BOOL(display.fewer_gpu_waits), true),
     choice("Prepare Shaders", "Builds known shaders early to reduce stutter.", kOffOn, 2, ROW_BOOL(display.shader_prewarm), true),
 };
@@ -192,26 +197,46 @@ const Row kPicture[] = {
     number("Brightness", "Dims the whole picture, white included. 1.00 is the game's own.", 0, 75, "%.2f", 0.25, 0.01, ROW_STEP(extras.picture.brightness, 0.25, 0.01), true),
 };
 
-// The Mouse mode key (the Joy-Con 2 mouse mode, pkp_play.cpp): its binding in play, any key, mouse button or wheel notch, saved at once. The
-// new key replaces any other play binding of that input; an all-context binding of it still works elsewhere.
-class MouseModeKey final : public CaptureClient {
+// Game actions bound in play. A new key replaces that input's play binding; an all-context binding still works elsewhere.
+class PlayBindingKey final : public CaptureClient {
 public:
-    const char* name() const override { return "Mouse Mode Key"; }
+    PlayBindingKey(const char* label, play::Act action, bool keyboard_only = false)
+        : label_(label), action_(action), keyboard_only_(keyboard_only) {}
+
+    const char* name() const override { return label_; }
     std::string bound() const override {
+        const S s = play::current_settings();
         std::string out;
-        for (const play::Binding& b : play::current_settings().bindings)
-            if (b.act == play::Act::MouseMode && (b.ctx == play::Ctx::Play || b.ctx == play::Ctx::All))
-                out += (out.empty() ? "" : ", ") + play::input_name(b.in);
+        for (const play::Binding& b : s.bindings) {
+            if (b.act != action_ || (b.ctx != play::Ctx::Play && b.ctx != play::Ctx::All)) continue;
+            if (b.ctx == play::Ctx::All && std::any_of(s.bindings.begin(), s.bindings.end(), [&](const play::Binding& other) {
+                    return other.ctx == play::Ctx::Play && other.in == b.in;
+                })) continue;
+            out += (out.empty() ? "" : ", ") + play::input_name(b.in);
+        }
         return out.empty() ? "None" : out;
     }
     bool take(const play::InputId& in) override {
         S s = play::current_settings();
-        std::erase_if(s.bindings, [&](const play::Binding& b) { return b.act == play::Act::MouseMode || (b.in == in && b.ctx == play::Ctx::Play); });
-        s.bindings.push_back(play::Binding{in, play::Ctx::Play, play::Act::MouseMode, play::Trig::Press, 0});
+        if (keyboard_only_) {
+            play::InputId persisted;
+            if (in.kind != play::InKind::Key || in == s.fps.key || in == s.quit.key ||
+                !play::parse_input(play::input_name(in), &persisted) || persisted != in) return false;
+        }
+        std::erase_if(s.bindings, [&](const play::Binding& b) { return b.act == action_ || (b.in == in && b.ctx == play::Ctx::Play); });
+        s.bindings.push_back(play::Binding{in, play::Ctx::Play, action_, play::Trig::Press, 0});
         play::apply_settings(s);   // main thread, next frame; also writes controls.ini
         return true;
     }
-} g_mouse_mode_key;
+
+private:
+    const char* label_;
+    play::Act action_;
+    bool keyboard_only_;
+};
+
+PlayBindingKey g_mouse_mode_key{"Mouse Mode Key", play::Act::MouseMode};
+PlayBindingKey g_save_key{"Quick Save Key", play::Act::Save, true};
 
 #define SENS(p) [](const S& s) { return static_cast<int>(std::lround(play::source_sens(s.mouse.p) * 10.0)); }, [](S& s, int v) { s.mouse.p = play::rad_per_count(v / 10.0); }
 const Row kMouse[] = {
@@ -223,6 +248,7 @@ const Row kMouse[] = {
     names("Button Icons", "The button icons in prompts. Automatic follows the last device used.", kPromptNames, static_cast<uint8_t>(std::size(kPromptNames)), ROW_ENUM(prompts.style, play::PromptStyle)),
     capture_row("Mouse Mode Key", "Turns the Joy-Con 2 mouse mode on and off (point and click to place and break). To change it, press left or right on this row (or click it), then press the new key or mouse button. Esc cancels.",
                 g_mouse_mode_key),
+    capture_row("Quick Save Key", "Saves while you play. Press left or right on this row (or click it), then press a keyboard key. It replaces that key's action in play. Esc cancels.", g_save_key),
 };
 
 const Row kController[] = {
@@ -242,7 +268,8 @@ const Row kController[] = {
 };
 
 // The gameplay mods (the gameplay() rows of pkp_settings_table.h), labelled as in the launcher's Settings > Gameplay (settings-schema.js
-// GAMEPLAY). title_quit has no row (hidden by the repo owner). Every mod reads its keys when it installs, so these rows apply after a restart;
+// GAMEPLAY). title_quit has no row (hidden by the repo owner); the inventory mods have their own tab (kInventory). Every mod reads its keys
+// when it installs, so these rows apply after a restart;
 // the shoulder camera's two distances are live keys (no switch: 0 / 0 is the game's own camera), in force when the screen commits. A tab has
 // kDirtySlot (13) rows; camera aim's debug view moved to Performance (an on-screen diagnostic) to keep this tab within that.
 using settings::Key;
@@ -251,15 +278,22 @@ constexpr Row kGameplay[] = {
     key_row("Running jump speed kept", "With the running jump on: how much of the extra running speed is kept.", Key::JumpMomentumStrength, 0.01, "%.0f%%", 100),
     key_row("Camera aim", "Abilities and tools aim where the camera looks instead of where your character faces, and your character turns to the target when the ability starts.", Key::CameraAim),
     key_row("Extra reach in blocks", "With camera aim: extra blocks of reach. Off is the game's own range.", Key::CameraAimReach, 1, "%.0f", 1, "Off"),
-    key_row("Sort button in the bag and containers", "Click Hold to Sort in the bag and storage boxes to sort at once.", Key::InventorySort),
-    key_row("Sort each time the bag opens", "Sorts the bag each time the bag or a container screen opens.", Key::InventoryAutosort),
     key_row("Search in the crafting screen", "A Search button in the key guide of the crafting screen.", Key::CraftSearch),
-    key_row("Save button in the pause menu", "A Save prompt in the key guide of the pause menu: writes the save and stays in the world.", Key::SaveNow),
+    key_row("Save button in the pause menu", "Enables the Save prompt and the Quick Save Key. Both save your progress and keep you in the world.", Key::SaveNow),
     key_row("Item editor (experimental)", "Adds an Items tab to this screen that changes how many of an item you hold. Not during Link Play.", Key::ItemEditor),
-    key_row("More Pokémon in town", "Experimental: more Pokémon can live in your town than the game's 25.", Key::PokemonCap),
-    key_row("Pokémon in town", "With More Pokémon in town: how many can live there, 25 to 64. Visitors and spawns share the game's 64 slots, so a high number leaves them less room.", Key::PokemonCapLimit, 1, "%.0f"),
+    key_row("More creatures in town", "Experimental: more creatures can live in your town than the game's 25.", Key::PokemonCap),
+    key_row("Creatures in town", "With More creatures in town: how many can live there, 25 to 50. Visitors and spawns share the game's 50 drawn creatures, so a high number leaves them less room.", Key::PokemonCapLimit, 1, "%.0f"),
     key_row("Shoulder camera: side", "Moves the camera to the side so your character no longer blocks the view, in blocks. Right is positive, left negative; 0 is the game's own camera.", Key::CameraShoulderSide, 0.1, "%+.1f"),
     key_row("Shoulder camera: height", "Moves the camera up, in blocks. 0 is the game's own camera.", Key::CameraShoulderHeight, 0.1, "%+.1f"),
+};
+// The inventory mods (bag, storage boxes), gameplay() rows like kGameplay's and labelled as in the launcher, in a tab of their own so the
+// Gameplay tab keeps room within its kDirtySlot (13) rows.
+constexpr Row kInventory[] = {
+    key_row("Sort button in the bag and containers", "Click Hold to Sort in the bag and storage boxes to sort at once.", Key::InventorySort),
+    key_row("Sort each time the bag opens", "Sorts the bag each time the bag or a container screen opens.", Key::InventoryAutosort),
+    key_row("Storage box tabs", "Extra pages in storage boxes; L or R switches them. About the first 22 boxes (big boxes: 42) get every page. Off in Link Play.", Key::BoxTabs),
+    key_row("Pages per storage box", "Pages per storage box, 2 to 12 (20 slots each). A page that holds items stays shown if you lower this.", Key::BoxTabPages, 1, "%.0f"),
+    key_row("Tabs per big storage box", "Tabs of 60 slots per big storage box, 1 to 6 (6: 360 slots). A tab that holds items stays shown if you lower this.", Key::BigBoxTabs, 1, "%.0f"),
 };
 // clang-format on
 
@@ -267,7 +301,8 @@ constexpr Row kGameplay[] = {
 
 constinit const RowList kSoundRows = rows_of(kSound), kDisplayRows = rows_of(kDisplay), kPerformanceRows = rows_of(kPerformance),
                         kGraphicsRows = rows_of(kGraphics), kPictureRows = rows_of(kPicture), kMouseRows = rows_of(kMouse),
-                        kControllerRows = rows_of(kController), kGameplayRows = rows_of(kGameplay);
+                        kControllerRows = rows_of(kController), kGameplayRows = rows_of(kGameplay),
+                        kInventoryRows = rows_of(kInventory);
 
 void refresh_audio_devices() {
     g_devices.clear();

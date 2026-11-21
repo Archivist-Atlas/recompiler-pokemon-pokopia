@@ -86,8 +86,13 @@ std::string kbm_pack_name(const InputId& id);
 // Pack entry name for a pad style and one Switch button bit (hid::btn(kBtnA) ...): the icon of the physical pad button that
 // presses that button, following the pad remap and label_abxy ("" when nothing presses it). A d-pad bit gives that direction
 // ("xbox/dpad_up": the cross with the up arm lit); a bit no pad button has (a stick click) gives "". For games whose prompts are
-// their own glyph slots in an atlas rather than the small icon textures of a PromptGame (Pokopia).
+// their own glyph slots in an atlas rather than the small icon textures of a PromptGame (the game).
 std::string pad_pack_name(PromptStyle style, const PadSettings& pad, bool label_abxy, uint64_t switch_bit);
+
+// Where the pad button that presses a Switch face button sits (PadSrc::South, East, West or North), following the pad remap and
+// label_abxy as pad_pack_name does. False when no face button presses it (remapped to a shoulder or a grip) or the bits are not
+// one button. For games whose prompts also show where the button sits on the pad.
+bool pad_face_position(const PadSettings& pad, bool label_abxy, uint64_t switch_bit, PadSrc* out);
 
 // True for the styles that show a controller's icon set (every style but Switch, Keyboard and Auto).
 bool prompt_style_is_pad(PromptStyle style);
