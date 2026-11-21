@@ -456,7 +456,7 @@ int main(int argc, char** argv) {
                 po.place_windows = disp.places_window;
                 nxrt::platform::init(po);
                 nxrt::platform::WindowDesc wd;
-                wd.title = nxrt::game::info().product;
+                wd.title = "Pok\xc3\xa9mon Pokopia (Switch recomp) - F11: fullscreen";
                 wd.width = disp.width;
                 wd.height = disp.height;
                 wd.focusable = disp.takes_focus;

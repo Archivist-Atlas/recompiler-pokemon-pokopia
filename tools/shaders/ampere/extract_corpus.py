@@ -246,6 +246,62 @@ def nso_image(d):
     return bytes(img)
 
 
+def scan_ld_bin(path, out, nn, layout):
+    """Scan KTGL Linked Data archive (LD_C0_R.BIN + sibling LI_C0_R.IDX) for GLSLC outputs."""
+    global OUT
+    OUT = out
+    low_priority()
+    idx_path = os.path.join(os.path.dirname(path), 'LI_C0_R.IDX')
+    if not os.path.isfile(idx_path):
+        return []
+    rows = []
+    name = os.path.basename(path)
+    idx = open(idx_path, 'rb').read()
+    s = sink(out, nn, layout)
+    try:
+        with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as ld:
+            ld_len = len(ld)
+            for i in range(len(idx) // 32):
+                off, usz, csz, comp = struct.unpack_from('<4Q', idx, i * 32)
+                if usz == 0 or off + max(usz, csz) > ld_len:
+                    continue
+                if not comp:
+                    data = bytes(ld[off:off + usz])
+                else:
+                    if csz < 12 or off + 12 > ld_len:
+                        continue
+                    _, nchunks, _ = struct.unpack_from('<3I', ld, off)
+                    if nchunks == 0 or nchunks > 100000 or off + 12 + 4 * nchunks > off + csz:
+                        continue
+                    sizes = struct.unpack_from(f'<{nchunks}I', ld, off + 12)
+                    pos = (off + 12 + 4 * nchunks + 0x7f) & ~0x7f
+                    buf = bytearray()
+                    ok = True
+                    for slen in sizes:
+                        if slen < 4 or pos + slen > off + csz:
+                            ok = False
+                            break
+                        clen, = struct.unpack_from('<I', ld, pos)
+                        try:
+                            if clen == 0 or pos + 4 + clen > pos + slen:
+                                buf.extend(ld[pos + 4:pos + slen])
+                            else:
+                                buf.extend(zlib.decompress(ld[pos + 4:pos + 4 + clen]))
+                        except Exception:
+                            ok = False
+                            break
+                        pos = (pos + slen + 0x7f) & ~0x7f
+                    if not ok:
+                        continue
+                    data = bytes(buf)
+                if GLSLC_MAGIC in data:
+                    rows += slim([(name, off, i, 0, 'LD', go, si, stage_of(ctrl), ctrl, code, gb)
+                                  for go, gb, secs in glslc_outputs(data) for si, ctrl, code in secs], s)
+    finally:
+        s.close()
+    return rows
+
+
 def scan_main(path, out, nn, layout):
     global OUT
     OUT = out
@@ -281,7 +337,15 @@ def main():
                     by_rel.setdefault(os.path.relpath(p, root).replace(os.sep, '/'), p)
     # (name for the progress lines, host path, function): the results are read in this order (it decides the outputs), but the
     # largest files are submitted first, so the scan doesn't end on a 2.4 GB file started late
-    tasks = [(k, by_rel[k], scan_file) for k in sorted(by_rel)] + ([('main', a.main, scan_main)] if a.main else [])
+    ld_bin = None
+    for top in [a.romfs] + ([a.romfs_base] if a.romfs_base else []):
+        cand = os.path.join(top, 'LD_C0_R.BIN')
+        if os.path.isfile(cand) and os.path.isfile(os.path.join(top, 'LI_C0_R.IDX')):
+            ld_bin = cand
+            break
+    tasks = ([(k, by_rel[k], scan_file) for k in sorted(by_rel)]
+             + ([('LD_C0_R.BIN', ld_bin, scan_ld_bin)] if ld_bin else [])
+             + ([('main', a.main, scan_main)] if a.main else []))
     for sub in ('pack',) if a.layout == 'packs' else ('code', 'ctrl', 'glslc'):
         os.makedirs(os.path.join(a.out, sub), exist_ok=True)
     seen = {}
